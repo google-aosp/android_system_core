@@ -214,6 +214,15 @@ inline bool operator _op_ (const U* o) const {                  \
 #pragma clang diagnostic ignored "-Wweak-vtables"
 #endif
 
+#ifdef REFBASE_JB_MR1_COMPAT_SYMBOLS
+class ReferenceConverterBase {
+public:
+    virtual size_t getReferenceTypeSize() const = 0;
+    virtual void* getReferenceBase(void const*) const = 0;
+    inline virtual ~ReferenceConverterBase() { }
+};
+#endif
+
 class ReferenceRenamer {
 protected:
     // destructor is purposedly not virtual so we avoid code overhead from
