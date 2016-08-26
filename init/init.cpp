@@ -419,8 +419,6 @@ static void export_oem_lock_status() {
 }
 
 static void export_kernel_boot_props() {
-    char tmp[PROP_VALUE_MAX];
-    int ret;
     struct {
         const char *src_prop;
         const char *dst_prop;
@@ -438,15 +436,14 @@ static void export_kernel_boot_props() {
    get_hardware_name(hardware, &revision);
    /* if this was given on kernel command line, override what we read
    * before (e.g. from /proc/cpuinfo), if anything */
-   ret = property_get("ro.boot.hardware", tmp);
-   if (ret)
-       strlcpy(hardware, tmp, sizeof(hardware));
+   std::string ro_hard = property_get("ro.boot.hardware");
+   if (strlcpy(hardware, ro_hard.c_str(), sizeof(hardware)))
    property_set("ro.hardware", hardware);
 
-   ret = property_get("ro.boot.revision", tmp);
-   if (!ret)
-       snprintf(tmp, PROP_VALUE_MAX, "%d", revision);
-   property_set("ro.revision", tmp);
+   std::string ro_rev = property_get("ro.boot.revision");
+   if (ro_rev.empty())
+      ro_rev = revision;
+   property_set("ro.revision", ro_rev.c_str());
 }
 
 static void process_kernel_dt() {
