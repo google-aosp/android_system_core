@@ -72,7 +72,8 @@ struct selabel_handle *sehandle;
 struct selabel_handle *sehandle_prop;
 
 static int property_triggers_enabled = 0;
-
+static char hardware[32];
+static unsigned revision = 0;
 static char qemu[32];
 
 int have_console;
@@ -418,6 +419,8 @@ static void export_oem_lock_status() {
 }
 
 static void export_kernel_boot_props() {
+    char tmp[PROP_VALUE_MAX];
+    int ret;
     struct {
         const char *src_prop;
         const char *dst_prop;
@@ -427,13 +430,23 @@ static void export_kernel_boot_props() {
         { "ro.boot.mode",       "ro.bootmode",   "unknown", },
         { "ro.boot.baseband",   "ro.baseband",   "unknown", },
         { "ro.boot.bootloader", "ro.bootloader", "unknown", },
-        { "ro.boot.hardware",   "ro.hardware",   "unknown", },
-        { "ro.boot.revision",   "ro.revision",   "0", },
     };
     for (size_t i = 0; i < ARRAY_SIZE(prop_map); i++) {
         std::string value = property_get(prop_map[i].src_prop);
         property_set(prop_map[i].dst_prop, (!value.empty()) ? value.c_str() : prop_map[i].default_value);
     }
+   get_hardware_name(hardware, &revision);
+   /* if this was given on kernel command line, override what we read
+   * before (e.g. from /proc/cpuinfo), if anything */
+   ret = property_get("ro.boot.hardware", tmp);
+   if (ret)
+       strlcpy(hardware, tmp, sizeof(hardware));
+   property_set("ro.hardware", hardware);
+
+   ret = property_get("ro.boot.revision", tmp);
+   if (!ret)
+       snprintf(tmp, PROP_VALUE_MAX, "%d", revision);
+   property_set("ro.revision", tmp);
 }
 
 static void process_kernel_dt() {
