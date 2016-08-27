@@ -434,10 +434,7 @@ static void export_kernel_boot_props() {
         property_set(prop_map[i].dst_prop, (!value.empty()) ? value.c_str() : prop_map[i].default_value);
     }
    get_hardware_name(hardware, &revision);
-   /* if this was given on kernel command line, override what we read
-   * before (e.g. from /proc/cpuinfo), if anything */
-   std::string ro_hard = property_get("ro.boot.hardware");
-   if (strlcpy(hardware, ro_hard.c_str(), sizeof(hardware)))
+   /* parse hardware from /proc/cpuinfo */
    property_set("ro.hardware", hardware);
 
    std::string ro_rev = property_get("ro.boot.revision");
