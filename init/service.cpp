@@ -354,14 +354,14 @@ bool Service::Start() {
         int rc = getcon(&mycon);
         if (rc < 0) {
             ERROR("could not get context while starting '%s'\n", name_.c_str());
-            return false;
+            //return;
         }
 
         rc = getfilecon(args_[0].c_str(), &fcon);
         if (rc < 0) {
             ERROR("could not get context while starting '%s'\n", name_.c_str());
-            free(mycon);
-            return false;
+            //freecon(mycon);
+            //return;
         }
 
         char* ret_scon = nullptr;
@@ -377,11 +377,11 @@ bool Service::Start() {
             //free(fcon);
             //return false;
         }
-        free(mycon);
-        free(fcon);
+        freecon(mycon);
+        freecon(fcon);
         if (rc < 0) {
             ERROR("could not get context while starting '%s'\n", name_.c_str());
-            return false;
+            //return;
         }
     }
 
