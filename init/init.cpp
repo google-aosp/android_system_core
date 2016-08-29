@@ -560,7 +560,7 @@ static void selinux_initialize(bool in_kernel_domain) {
         INFO("Loading SELinux policy...\n");
         if (selinux_android_load_policy() < 0) {
             ERROR("failed to load policy: %s\n", strerror(errno));
-            security_failure();
+            //security_failure();
         }
 
         bool kernel_enforcing = (security_getenforce() == 1);
@@ -569,12 +569,12 @@ static void selinux_initialize(bool in_kernel_domain) {
             if (security_setenforce(is_enforcing)) {
                 ERROR("security_setenforce(%s) failed: %s\n",
                       is_enforcing ? "true" : "false", strerror(errno));
-                security_failure();
+                //security_failure();
             }
         }
 
         if (write_file("/sys/fs/selinux/checkreqprot", "0") == -1) {
-            security_failure();
+            //security_failure();
         }
 
         NOTICE("(Initializing SELinux %s took %.2fs.)\n",
@@ -664,13 +664,13 @@ int main(int argc, char** argv) {
     if (is_first_stage) {
         if (restorecon("/init") == -1) {
             ERROR("restorecon failed: %s\n", strerror(errno));
-            security_failure();
+            //security_failure();
         }
         char* path = argv[0];
         char* args[] = { path, const_cast<char*>("--second-stage"), nullptr };
         if (execv(path, args) == -1) {
             ERROR("execv(\"%s\") failed: %s\n", path, strerror(errno));
-            security_failure();
+            //security_failure();
         }
     }
 
