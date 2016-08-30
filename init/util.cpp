@@ -105,12 +105,8 @@ int create_socket(const char *name, int type, mode_t perm, uid_t uid,
     int fd, ret;
     char *filecon;
 
-    if (socketcon) {
-        if (setsockcreatecon(socketcon) == -1) {
-            ERROR("setsockcreatecon(\"%s\") failed: %s\n", socketcon, strerror(errno));
-            return -1;
-        }
-    }
+    if (socketcon)
+        setsockcreatecon(socketcon);
 
     fd = socket(PF_UNIX, type, 0);
     if (fd < 0) {
