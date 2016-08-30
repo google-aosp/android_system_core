@@ -29,7 +29,6 @@
 #include <sys/socket.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
-#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -67,20 +66,19 @@
 #define UNMOUNT_CHECK_MS 5000
 #define UNMOUNT_CHECK_TIMES 10
 
+// System call provided by bionic but not in any header file.
+extern "C" int init_module(void *, unsigned long, const char *);
+
 static const int kTerminateServiceDelayMicroSeconds = 50000;
 
 static int insmod(const char *filename, const char *options) {
-    int fd = open(filename, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd == -1) {
-        ERROR("insmod: open(\"%s\") failed: %s", filename, strerror(errno));
+    std::string module;
+    if (!read_file(filename, &module)) {
         return -1;
     }
-    int rc = syscall(__NR_finit_module, fd, options, 0);
-    if (rc == -1) {
-        ERROR("finit_module for \"%s\" failed: %s", filename, strerror(errno));
-    }
-    close(fd);
-    return rc;
+
+    // TODO: use finit_module for >= 3.8 kernels.
+    return init_module(&module[0], module.size(), options);
 }
 
 static int __ifupdown(const char *interface, int up) {
