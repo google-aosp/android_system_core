@@ -427,7 +427,7 @@ static void export_kernel_boot_props() {
         { "ro.boot.mode",       "ro.bootmode",   "unknown", },
         { "ro.boot.baseband",   "ro.baseband",   "unknown", },
         { "ro.boot.bootloader", "ro.bootloader", "unknown", },
-        { "ro.boot.hardware",   "ro.hardware",   "unknown", },
+        { "ro.boot.hardware",   "ro.hardware",   "hawaii_ss_kyleprods", },
         { "ro.boot.revision",   "ro.revision",   "0", },
     };
     for (size_t i = 0; i < ARRAY_SIZE(prop_map); i++) {
