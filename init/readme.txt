@@ -109,16 +109,9 @@ socket <name> <type> <perm> [ <user> [ <group> [ <seclabel> ] ] ]
 user <username>
   Change to username before exec'ing this service.
   Currently defaults to root.  (??? probably should default to nobody)
-  As of Android M, processes should use this option even if they
-  require linux capabilities.  Previously, to acquire linux
-  capabilities, a process would need to run as root, request the
-  capabilities, then drop to its desired uid.  There is a new
-  mechanism through fs_config that allows device manufacturers to add
-  linux capabilities to specific binaries on a file system that should
-  be used instead. This mechanism is described on
-  http://source.android.com/devices/tech/config/filesystem.html.  When
-  using this new mechanism, processes can use the user option to
-  select their desired uid without ever running as root.
+  Currently, if your process requires linux capabilities then you cannot use
+  this command. You must instead request the capabilities in-process while
+  still root, and then drop to your desired uid.
 
 group <groupname> [ <groupname> ]*
   Change to groupname before exec'ing this service.  Additional
