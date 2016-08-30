@@ -494,11 +494,11 @@ static int do_mount_all(const std::vector<std::string>& args) {
     import_late(args, 2);
 
     if (ret == FS_MGR_MNTALL_DEV_NEEDS_ENCRYPTION) {
-        ActionManager::GetInstance().QueueEventTrigger("encrypt");
+        property_set("vold.decrypt", "trigger_encryption");
     } else if (ret == FS_MGR_MNTALL_DEV_MIGHT_BE_ENCRYPTED) {
         property_set("ro.crypto.state", "encrypted");
         property_set("ro.crypto.type", "block");
-        ActionManager::GetInstance().QueueEventTrigger("defaultcrypto");
+        property_set("vold.decrypt", "trigger_default_encryption");
     } else if (ret == FS_MGR_MNTALL_DEV_NOT_ENCRYPTED) {
         property_set("ro.crypto.state", "unencrypted");
         ActionManager::GetInstance().QueueEventTrigger("nonencrypted");
