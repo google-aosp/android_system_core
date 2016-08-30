@@ -82,7 +82,6 @@ public:
     bool Enable();
     void Reset();
     void Stop();
-    void Terminate();
     void Restart();
     void RestartIfNeeded(time_t& process_needs_restart);
     bool Reap();
@@ -168,21 +167,16 @@ public:
     Service* FindServiceByName(const std::string& name) const;
     Service* FindServiceByPid(pid_t pid) const;
     Service* FindServiceByKeychord(int keychord_id) const;
-    void ForEachService(std::function<void(Service*)> callback) const;
+    void ForEachService(void (*func)(Service* svc)) const;
     void ForEachServiceInClass(const std::string& classname,
                                void (*func)(Service* svc)) const;
     void ForEachServiceWithFlags(unsigned matchflags,
                              void (*func)(Service* svc)) const;
-    void ReapAnyOutstandingChildren();
     void RemoveService(const Service& svc);
     void DumpState() const;
 
 private:
     ServiceManager();
-
-    // Cleans up a child process that exited.
-    // Returns true iff a children was cleaned up.
-    bool ReapOneProcess();
 
     static int exec_count_; // Every service needs a unique name.
     std::vector<std::unique_ptr<Service>> services_;
