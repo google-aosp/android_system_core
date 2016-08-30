@@ -242,11 +242,7 @@ static void make_device(const char *path,
 
     mode = get_device_perm(path, links, &uid, &gid) | (block ? S_IFBLK : S_IFCHR);
 
-    if (selabel_lookup_best_match(sehandle, &secontext, path, links, mode)) {
-        ERROR("Device '%s' not created; cannot find SELinux label (%s)\n",
-                path, strerror(errno));
-        return;
-    }
+    selabel_lookup_best_match(sehandle, &secontext, path, links, mode);
     setfscreatecon(secontext);
 
     dev = makedev(major, minor);
@@ -256,19 +252,14 @@ static void make_device(const char *path,
      * racy. Fixing the gid race at least fixed the issue with system_server
      * opening dynamic input devices under the AID_INPUT gid. */
     setegid(gid);
-    /* If the node already exists update its SELinux label to handle cases when
-     * it was created with the wrong context during coldboot procedure. */
-    if (mknod(path, mode, dev) && (errno == EEXIST)) {
-        if (lsetfilecon(path, secontext)) {
-            ERROR("Cannot set '%s' SELinux label on '%s' device (%s)\n",
-                    secontext, path, strerror(errno));
-        }
-    }
+    mknod(path, mode, dev);
     chown(path, uid, -1);
     setegid(AID_ROOT);
 
-    freecon(secontext);
-    setfscreatecon(NULL);
+    if (secontext) {
+        freecon(secontext);
+        setfscreatecon(NULL);
+    }
 }
 
 static void add_platform_device(const char *path)
