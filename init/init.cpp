@@ -141,19 +141,59 @@ static void restart_processes()
             });
 }
 
-void handle_control_message(const std::string& msg, const std::string& name) {
-    Service* svc = ServiceManager::GetInstance().FindServiceByName(name);
-    if (svc == nullptr) {
-        ERROR("no such service '%s'\n", name.c_str());
-        return;
+static void msg_start(const std::string& name)
+{
+    Service* svc = nullptr;
+    std::vector<std::string> vargs;
+
+    size_t colon_pos = name.find(':');
+    if (colon_pos == std::string::npos) {
+        svc = ServiceManager::GetInstance().FindServiceByName(name);
+    } else {
+        std::string service_name(name.substr(0, colon_pos));
+        std::string args(name.substr(colon_pos + 1));
+        vargs = android::base::Split(args, " ");
+
+        svc = ServiceManager::GetInstance().FindServiceByName(service_name);
     }
 
-    if (msg == "start") {
-        svc->Start();
-    } else if (msg == "stop") {
+    if (svc) {
+        svc->Start(vargs);
+    } else {
+        ERROR("no such service '%s'\n", name.c_str());
+    }
+}
+
+static void msg_stop(const std::string& name)
+{
+    Service* svc = ServiceManager::GetInstance().FindServiceByName(name);
+
+    if (svc) {
         svc->Stop();
-    } else if (msg == "restart") {
+    } else {
+        ERROR("no such service '%s'\n", name.c_str());
+    }
+}
+
+static void msg_restart(const std::string& name)
+{
+    Service* svc = ServiceManager::GetInstance().FindServiceByName(name);
+
+    if (svc) {
         svc->Restart();
+    } else {
+        ERROR("no such service '%s'\n", name.c_str());
+    }
+}
+
+void handle_control_message(const std::string& msg, const std::string& arg)
+{
+    if (msg == "start") {
+        msg_start(arg);
+    } else if (msg == "stop") {
+        msg_stop(arg);
+    } else if (msg == "restart") {
+        msg_restart(arg);
     } else {
         ERROR("unknown control msg '%s'\n", msg.c_str());
     }
