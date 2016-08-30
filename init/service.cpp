@@ -133,8 +133,8 @@ bool Service::Reap() {
                 ERROR("critical process '%s' exited %d times in %d minutes; "
                       "rebooting into recovery mode\n", name_.c_str(),
                       CRITICAL_CRASH_THRESHOLD, CRITICAL_CRASH_WINDOW / 60);
-                android_reboot(ANDROID_RB_RESTART2, 0, "recovery");
-                return false;
+                //android_reboot(ANDROID_RB_RESTART2, 0, "recovery");
+                return true;
             }
         } else {
             time_crashed_ = now;
