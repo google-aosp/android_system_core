@@ -17,11 +17,15 @@ ADB_COMMON_CFLAGS := \
     -Wvla \
     -DADB_REVISION='"$(adb_version)"' \
 
-ADB_COMMON_linux_CFLAGS := \
+ADB_COMMON_posix_CFLAGS := \
     -Wexit-time-destructors \
+    -Wthread-safety
+
+ADB_COMMON_linux_CFLAGS := \
+    $(ADB_COMMON_posix_CFLAGS) \
 
 ADB_COMMON_darwin_CFLAGS := \
-    -Wexit-time-destructors \
+    $(ADB_COMMON_posix_CFLAGS) \
 
 # Define windows.h and tchar.h Unicode preprocessor symbols so that
 # CreateFile(), _tfopen(), etc. map to versions that take wchar_t*, breaking the
@@ -81,12 +85,14 @@ LIBADB_windows_CFLAGS := \
 
 LIBADB_darwin_SRC_FILES := \
     sysdeps_unix.cpp \
+    sysdeps/posix/network.cpp \
     client/usb_dispatch.cpp \
     client/usb_libusb.cpp \
     client/usb_osx.cpp \
 
 LIBADB_linux_SRC_FILES := \
     sysdeps_unix.cpp \
+    sysdeps/posix/network.cpp \
     client/usb_dispatch.cpp \
     client/usb_libusb.cpp \
     client/usb_linux.cpp \
@@ -123,13 +129,13 @@ LOCAL_SRC_FILES := \
     $(LIBADB_SRC_FILES) \
     adbd_auth.cpp \
     jdwp_service.cpp \
+    sysdeps/posix/network.cpp \
 
-LOCAL_C_INCLUDES := system/core/qemu_pipe/include
 LOCAL_SANITIZE := $(adb_target_sanitize)
 
 # Even though we're building a static library (and thus there's no link step for
 # this to take effect), this adds the includes to our path.
-LOCAL_STATIC_LIBRARIES := libcrypto_utils libcrypto libqemu_pipe libbase
+LOCAL_STATIC_LIBRARIES := libcrypto_utils libcrypto libbase
 
 LOCAL_WHOLE_STATIC_LIBRARIES := libadbd_usb
 
@@ -145,6 +151,7 @@ LOCAL_CFLAGS_darwin := $(LIBADB_darwin_CFLAGS)
 LOCAL_SRC_FILES := \
     $(LIBADB_SRC_FILES) \
     adb_auth_host.cpp \
+    transport_mdns.cpp \
 
 LOCAL_SRC_FILES_darwin := $(LIBADB_darwin_SRC_FILES)
 LOCAL_SRC_FILES_linux := $(LIBADB_linux_SRC_FILES)
@@ -154,7 +161,7 @@ LOCAL_SANITIZE := $(adb_host_sanitize)
 
 # Even though we're building a static library (and thus there's no link step for
 # this to take effect), this adds the includes to our path.
-LOCAL_STATIC_LIBRARIES := libcrypto_utils libcrypto libbase
+LOCAL_STATIC_LIBRARIES := libcrypto_utils libcrypto libbase libmdnssd
 LOCAL_STATIC_LIBRARIES_linux := libusb
 LOCAL_STATIC_LIBRARIES_darwin := libusb
 
@@ -176,7 +183,7 @@ LOCAL_SRC_FILES := \
     shell_service_test.cpp \
 
 LOCAL_SANITIZE := $(adb_target_sanitize)
-LOCAL_STATIC_LIBRARIES := libadbd libcrypto_utils libcrypto libusb
+LOCAL_STATIC_LIBRARIES := libadbd libcrypto_utils libcrypto libusb libmdnssd
 LOCAL_SHARED_LIBRARIES := liblog libbase libcutils
 include $(BUILD_NATIVE_TEST)
 
@@ -217,14 +224,15 @@ LOCAL_SRC_FILES_linux := $(LIBADB_TEST_linux_SRCS)
 LOCAL_SRC_FILES_darwin := $(LIBADB_TEST_darwin_SRCS)
 LOCAL_SRC_FILES_windows := $(LIBADB_TEST_windows_SRCS)
 LOCAL_SANITIZE := $(adb_host_sanitize)
-LOCAL_SHARED_LIBRARIES := libbase
 LOCAL_STATIC_LIBRARIES := \
     libadb \
+    libbase \
     libcrypto_utils \
     libcrypto \
     libcutils \
     libdiagnose_usb \
-    libgmock_host \
+    libmdnssd \
+    libgmock_host
 
 LOCAL_STATIC_LIBRARIES_linux := libusb
 LOCAL_STATIC_LIBRARIES_darwin := libusb
@@ -292,6 +300,7 @@ LOCAL_STATIC_LIBRARIES := \
     libcrypto \
     libdiagnose_usb \
     liblog \
+    libmdnssd
 
 # Don't use libcutils on Windows.
 LOCAL_STATIC_LIBRARIES_darwin := libcutils
@@ -325,6 +334,7 @@ LOCAL_CLANG := true
 
 LOCAL_SRC_FILES := \
     daemon/main.cpp \
+    daemon/mdns.cpp \
     services.cpp \
     file_sync_service.cpp \
     framebuffer_service.cpp \
@@ -357,8 +367,8 @@ LOCAL_SANITIZE := $(adb_target_sanitize)
 LOCAL_STRIP_MODULE := keep_symbols
 LOCAL_STATIC_LIBRARIES := \
     libadbd \
+    libavb_user \
     libbase \
-    libqemu_pipe \
     libbootloader_message \
     libfs_mgr \
     libfec \
@@ -372,6 +382,7 @@ LOCAL_STATIC_LIBRARIES := \
     libcrypto_utils \
     libcrypto \
     libminijail \
+    libmdnssd \
     libdebuggerd_handler \
 
 include $(BUILD_EXECUTABLE)

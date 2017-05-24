@@ -55,21 +55,16 @@ test_c_flags := \
     -fno-builtin \
 
 test_src_files := \
+    libc_test.cpp \
     liblog_test_default.cpp \
     liblog_test_local.cpp \
+    liblog_test_stderr.cpp \
+    liblog_test_stderr_local.cpp \
     log_id_test.cpp \
     log_radio_test.cpp \
     log_read_test.cpp \
     log_system_test.cpp \
     log_time_test.cpp
-
-# to prevent breaking the build if bionic not relatively visible to us
-ifneq ($(wildcard $(LOCAL_PATH)/../../../../bionic/libc/bionic/libc_logging.cpp),)
-
-test_src_files += \
-    libc_test.cpp
-
-endif
 
 # Build tests for the device (with .so). Run with:
 #   adb shell /data/nativetest/liblog-unit-tests/liblog-unit-tests

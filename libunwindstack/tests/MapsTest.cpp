@@ -22,21 +22,13 @@
 
 #include "Maps.h"
 
-#include "LogFake.h"
-
-class MapsTest : public ::testing::Test {
- protected:
-  void SetUp() override {
-    ResetLogs();
-  }
-};
-
-TEST_F(MapsTest, parse_permissions) {
-  MapsBuffer maps("1000-2000 ---- 00000000 00:00 0\n"
-                  "2000-3000 r--- 00000000 00:00 0\n"
-                  "3000-4000 -w-- 00000000 00:00 0\n"
-                  "4000-5000 --x- 00000000 00:00 0\n"
-                  "5000-6000 rwx- 00000000 00:00 0\n");
+TEST(MapsTest, parse_permissions) {
+  BufferMaps maps(
+      "1000-2000 ---- 00000000 00:00 0\n"
+      "2000-3000 r--- 00000000 00:00 0\n"
+      "3000-4000 -w-- 00000000 00:00 0\n"
+      "4000-5000 --x- 00000000 00:00 0\n"
+      "5000-6000 rwx- 00000000 00:00 0\n");
 
   ASSERT_TRUE(maps.Parse());
   ASSERT_EQ(5U, maps.Total());
@@ -74,10 +66,11 @@ TEST_F(MapsTest, parse_permissions) {
   ASSERT_EQ(it, maps.end());
 }
 
-TEST_F(MapsTest, parse_name) {
-  MapsBuffer maps("720b29b000-720b29e000 rw-p 00000000 00:00 0\n"
-                  "720b29e000-720b29f000 rw-p 00000000 00:00 0 /system/lib/fake.so\n"
-                  "720b29f000-720b2a0000 rw-p 00000000 00:00 0");
+TEST(MapsTest, parse_name) {
+  BufferMaps maps(
+      "720b29b000-720b29e000 rw-p 00000000 00:00 0\n"
+      "720b29e000-720b29f000 rw-p 00000000 00:00 0 /system/lib/fake.so\n"
+      "720b29f000-720b2a0000 rw-p 00000000 00:00 0");
 
   ASSERT_TRUE(maps.Parse());
   ASSERT_EQ(3U, maps.Total());
@@ -103,9 +96,10 @@ TEST_F(MapsTest, parse_name) {
   ASSERT_EQ(it, maps.end());
 }
 
-TEST_F(MapsTest, parse_offset) {
-  MapsBuffer maps("a000-e000 rw-p 00000000 00:00 0 /system/lib/fake.so\n"
-                  "e000-f000 rw-p 00a12345 00:00 0 /system/lib/fake.so\n");
+TEST(MapsTest, parse_offset) {
+  BufferMaps maps(
+      "a000-e000 rw-p 00000000 00:00 0 /system/lib/fake.so\n"
+      "e000-f000 rw-p 00a12345 00:00 0 /system/lib/fake.so\n");
 
   ASSERT_TRUE(maps.Parse());
   ASSERT_EQ(2U, maps.Total());
@@ -125,17 +119,40 @@ TEST_F(MapsTest, parse_offset) {
   ASSERT_EQ(maps.end(), it);
 }
 
-TEST_F(MapsTest, file_smoke) {
+TEST(MapsTest, device) {
+  BufferMaps maps(
+      "a000-e000 rw-p 00000000 00:00 0 /dev/\n"
+      "f000-f100 rw-p 00000000 00:00 0 /dev/does_not_exist\n"
+      "f100-f200 rw-p 00000000 00:00 0 /dev/ashmem/does_not_exist\n"
+      "f200-f300 rw-p 00000000 00:00 0 /devsomething/does_not_exist\n");
+
+  ASSERT_TRUE(maps.Parse());
+  ASSERT_EQ(4U, maps.Total());
+  auto it = maps.begin();
+  ASSERT_TRUE(it->flags & 0x8000);
+  ASSERT_EQ("/dev/", it->name);
+  ++it;
+  ASSERT_TRUE(it->flags & 0x8000);
+  ASSERT_EQ("/dev/does_not_exist", it->name);
+  ++it;
+  ASSERT_FALSE(it->flags & 0x8000);
+  ASSERT_EQ("/dev/ashmem/does_not_exist", it->name);
+  ++it;
+  ASSERT_FALSE(it->flags & 0x8000);
+  ASSERT_EQ("/devsomething/does_not_exist", it->name);
+}
+
+TEST(MapsTest, file_smoke) {
   TemporaryFile tf;
   ASSERT_TRUE(tf.fd != -1);
 
-  ASSERT_TRUE(android::base::WriteStringToFile(
-      "720b29b000-720b29e000 r-xp a0000000 00:00 0   /fake.so\n"
-      "720b2b0000-720b2e0000 r-xp b0000000 00:00 0   /fake2.so\n"
-      "720b2e0000-720b2f0000 r-xp c0000000 00:00 0   /fake3.so\n",
-      tf.path, 0660, getuid(), getgid()));
+  ASSERT_TRUE(
+      android::base::WriteStringToFile("720b29b000-720b29e000 r-xp a0000000 00:00 0   /fake.so\n"
+                                       "720b2b0000-720b2e0000 r-xp b0000000 00:00 0   /fake2.so\n"
+                                       "720b2e0000-720b2f0000 r-xp c0000000 00:00 0   /fake3.so\n",
+                                       tf.path, 0660, getuid(), getgid()));
 
-  MapsFile maps(tf.path);
+  FileMaps maps(tf.path);
 
   ASSERT_TRUE(maps.Parse());
   ASSERT_EQ(3U, maps.Total());
@@ -161,12 +178,13 @@ TEST_F(MapsTest, file_smoke) {
   ASSERT_EQ(it, maps.end());
 }
 
-TEST_F(MapsTest, find) {
-  MapsBuffer maps("1000-2000 r--p 00000010 00:00 0 /system/lib/fake1.so\n"
-                  "3000-4000 -w-p 00000020 00:00 0 /system/lib/fake2.so\n"
-                  "6000-8000 --xp 00000030 00:00 0 /system/lib/fake3.so\n"
-                  "a000-b000 rw-p 00000040 00:00 0 /system/lib/fake4.so\n"
-                  "e000-f000 rwxp 00000050 00:00 0 /system/lib/fake5.so\n");
+TEST(MapsTest, find) {
+  BufferMaps maps(
+      "1000-2000 r--p 00000010 00:00 0 /system/lib/fake1.so\n"
+      "3000-4000 -w-p 00000020 00:00 0 /system/lib/fake2.so\n"
+      "6000-8000 --xp 00000030 00:00 0 /system/lib/fake3.so\n"
+      "a000-b000 rw-p 00000040 00:00 0 /system/lib/fake4.so\n"
+      "e000-f000 rwxp 00000050 00:00 0 /system/lib/fake5.so\n");
   ASSERT_TRUE(maps.Parse());
   ASSERT_EQ(5U, maps.Total());
 

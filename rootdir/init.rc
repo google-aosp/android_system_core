@@ -150,15 +150,6 @@ on init
     write /dev/cpuctl/cpu.rt_period_us 1000000
     write /dev/cpuctl/cpu.rt_runtime_us 950000
 
-    mkdir /dev/cpuctl/bg_non_interactive
-    chown system system /dev/cpuctl/bg_non_interactive/tasks
-    chmod 0666 /dev/cpuctl/bg_non_interactive/tasks
-    # 5.0 %
-    write /dev/cpuctl/bg_non_interactive/cpu.shares 52
-    write /dev/cpuctl/bg_non_interactive/cpu.rt_period_us 1000000
-    # active FIFO threads will never be in BG
-    write /dev/cpuctl/bg_non_interactive/cpu.rt_runtime_us 10000
-
     # sets up initial cpusets for ActivityManager
     mkdir /dev/cpuset
     mount cpuset none /dev/cpuset
@@ -166,25 +157,25 @@ on init
     # this ensures that the cpusets are present and usable, but the device's
     # init.rc must actually set the correct cpus
     mkdir /dev/cpuset/foreground
-    write /dev/cpuset/foreground/cpus 0
-    write /dev/cpuset/foreground/mems 0
+    copy /dev/cpuset/cpus /dev/cpuset/foreground/cpus
+    copy /dev/cpuset/mems /dev/cpuset/foreground/mems
     mkdir /dev/cpuset/foreground/boost
-    write /dev/cpuset/foreground/boost/cpus 0
-    write /dev/cpuset/foreground/boost/mems 0
+    copy /dev/cpuset/cpus /dev/cpuset/foreground/boost/cpus
+    copy /dev/cpuset/mems /dev/cpuset/foreground/boost/mems
     mkdir /dev/cpuset/background
-    write /dev/cpuset/background/cpus 0
-    write /dev/cpuset/background/mems 0
+    copy /dev/cpuset/cpus /dev/cpuset/background/cpus
+    copy /dev/cpuset/mems /dev/cpuset/background/mems
 
     # system-background is for system tasks that should only run on
     # little cores, not on bigs
     # to be used only by init, so don't change system-bg permissions
     mkdir /dev/cpuset/system-background
-    write /dev/cpuset/system-background/cpus 0
-    write /dev/cpuset/system-background/mems 0
+    copy /dev/cpuset/cpus /dev/cpuset/system-background/cpus
+    copy /dev/cpuset/mems /dev/cpuset/system-background/mems
 
     mkdir /dev/cpuset/top-app
-    write /dev/cpuset/top-app/cpus 0
-    write /dev/cpuset/top-app/mems 0
+    copy /dev/cpuset/cpus /dev/cpuset/top-app/cpus
+    copy /dev/cpuset/mems /dev/cpuset/top-app/mems
 
     # change permissions for all cpusets we'll touch at runtime
     chown system system /dev/cpuset
@@ -244,15 +235,15 @@ on init
     # set RLIMIT_NICE to allow priorities from 19 to -20
     setrlimit 13 40 40
 
+    # This allows the ledtrig-transient properties to be created here so
+    # that they can be chown'd to system:system later on boot
+    write /sys/class/leds/vibrator/trigger "transient"
+
 # Healthd can trigger a full boot from charger mode by signaling this
 # property when the power button is held.
 on property:sys.boot_from_charger_mode=1
     class_stop charger
     trigger late-init
-
-# Load properties from /system/ + /factory after fs mount.
-on load_system_props_action
-    load_system_props
 
 on load_persist_props_action
     load_persist_props
@@ -274,11 +265,6 @@ on late-init
     trigger fs
     trigger post-fs
 
-    # Load properties from /system/ + /factory after fs mount. Place
-    # this in another action so that the load will be scheduled after the prior
-    # issued fs triggers have completed.
-    trigger load_system_props_action
-
     # Mount fstab in init.{$device}.rc by mount_all with '--late' parameter
     # to only mount entries with 'latemount'. This is needed if '--early' is
     # specified in the previous mount_all command on the fs stage.
@@ -290,6 +276,9 @@ on late-init
     # /data, which in turn can only be loaded when system properties are present.
     trigger post-fs-data
 
+    # Now we can start zygote for devices with file based encryption
+    trigger zygote-start
+
     # Load persist properties and override properties (if enabled) from /data.
     trigger load_persist_props_action
 
@@ -300,7 +289,16 @@ on late-init
     trigger boot
 
 on post-fs
+    # Load properties from
+    #     /system/build.prop,
+    #     /odm/build.prop,
+    #     /vendor/build.prop and
+    #     /factory/factory.prop
+    load_system_props
+    # start essential services
     start logd
+    start hwservicemanager
+
     # once everything is setup, no need to modify /
     mount rootfs rootfs / ro remount
     # Mount shared so changes propagate into child namespaces
@@ -348,6 +346,10 @@ on post-fs
     # create the lost+found directories, so as to enforce our permissions
     mkdir /cache/lost+found 0770 root root
 
+on late-fs
+    # HALs required before storage encryption can get unlocked (FBE/FDE)
+    class_start early_hal
+
 on post-fs-data
     # We chown/chmod /data again so because mount is run as root + defaults
     chown system system /data
@@ -382,6 +384,7 @@ on post-fs-data
     mkdir /data/misc/radio 0770 system radio
     mkdir /data/misc/sms 0770 system radio
     mkdir /data/misc/zoneinfo 0775 system system
+    mkdir /data/misc/textclassifier 0771 system system
     mkdir /data/misc/vpn 0770 system vpn
     mkdir /data/misc/shared_relro 0771 shared_relro shared_relro
     mkdir /data/misc/systemkeys 0700 system system
@@ -402,7 +405,7 @@ on post-fs-data
     mkdir /data/misc/boottrace 0771 system shell
     mkdir /data/misc/update_engine 0700 root root
     mkdir /data/misc/trace 0700 root root
-    mkdir /data/misc/reboot 0700 root root
+    mkdir /data/misc/reboot 0700 system system
     # profile file layout
     mkdir /data/misc/profiles 0771 system system
     mkdir /data/misc/profiles/cur 0771 system system
@@ -410,10 +413,12 @@ on post-fs-data
     mkdir /data/misc/profman 0770 system shell
     mkdir /data/misc/gcov 0770 root root
 
+    mkdir /data/vendor 0771 root root
+    mkdir /data/vendor/hardware 0771 root root
+
     # For security reasons, /data/local/tmp should always be empty.
     # Do not place files or directories in /data/local/tmp
     mkdir /data/local/tmp 0771 shell shell
-    mkdir /data/data 0771 system system
     mkdir /data/app-private 0771 system system
     mkdir /data/app-ephemeral 0771 system system
     mkdir /data/app-asec 0700 root root
@@ -466,7 +471,8 @@ on post-fs-data
 
     mkdir /data/user 0711 system system
     mkdir /data/user_de 0711 system system
-    symlink /data/data /data/user/0
+    mkdir /data/user/0 0711 system system
+    symlink /data/user/0 /data/data
 
     mkdir /data/media 0770 media_rw media_rw
     mkdir /data/media/obb 0770 media_rw media_rw
@@ -489,6 +495,29 @@ on post-fs-data
     # won't work.
     # Set indication (checked by vold) that we have finished this action
     #setprop vold.post_fs_data_done 1
+
+# It is recommended to put unnecessary data/ initialization from post-fs-data
+# to start-zygote in device's init.rc to unblock zygote start.
+on zygote-start && property:ro.crypto.state=unencrypted
+    # A/B update verifier that marks a successful boot.
+    exec_start update_verifier_nonencrypted
+    start netd
+    start zygote
+    start zygote_secondary
+
+on zygote-start && property:ro.crypto.state=unsupported
+    # A/B update verifier that marks a successful boot.
+    exec_start update_verifier_nonencrypted
+    start netd
+    start zygote
+    start zygote_secondary
+
+on zygote-start && property:ro.crypto.state=encrypted && property:ro.crypto.type=file
+    # A/B update verifier that marks a successful boot.
+    exec_start update_verifier_nonencrypted
+    start netd
+    start zygote
+    start zygote_secondary
 
 on boot
     # basic network init
@@ -553,6 +582,11 @@ on boot
     chown system system /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq
     chmod 0660 /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq
 
+    chown system system /sys/class/leds/vibrator/trigger
+    chown system system /sys/class/leds/vibrator/activate
+    chown system system /sys/class/leds/vibrator/brightness
+    chown system system /sys/class/leds/vibrator/duration
+    chown system system /sys/class/leds/vibrator/state
     chown system system /sys/class/timed_output/vibrator/enable
     chown system system /sys/class/leds/keyboard-backlight/brightness
     chown system system /sys/class/leds/lcd-backlight/brightness
@@ -564,7 +598,6 @@ on boot
     chown system system /sys/class/leds/red/device/grpfreq
     chown system system /sys/class/leds/red/device/grppwm
     chown system system /sys/class/leds/red/device/blink
-    chown system system /sys/class/timed_output/vibrator/enable
     chown system system /sys/module/sco/parameters/disable_esco
     chown system system /sys/kernel/ipv4/tcp_wmem_min
     chown system system /sys/kernel/ipv4/tcp_wmem_def
@@ -577,13 +610,12 @@ on boot
     # Define default initial receive window size in segments.
     setprop net.tcp.default_init_rwnd 60
 
-    # Start all binderized HAL daemons
-    start hwservicemanager
+    # Start standard binderized HAL daemons
+    class_start hal
+
     class_start core
 
 on nonencrypted
-    # A/B update verifier that marks a successful boot.
-    exec - root cache -- /system/bin/update_verifier nonencrypted
     class_start main
     class_start late_start
 
@@ -606,12 +638,12 @@ on property:vold.decrypt=trigger_post_fs_data
 
 on property:vold.decrypt=trigger_restart_min_framework
     # A/B update verifier that marks a successful boot.
-    exec - root cache -- /system/bin/update_verifier trigger_restart_min_framework
+    exec_start update_verifier
     class_start main
 
 on property:vold.decrypt=trigger_restart_framework
     # A/B update verifier that marks a successful boot.
-    exec - root cache -- /system/bin/update_verifier trigger_restart_framework
+    exec_start update_verifier
     class_start main
     class_start late_start
 
@@ -619,11 +651,14 @@ on property:vold.decrypt=trigger_shutdown_framework
     class_reset late_start
     class_reset main
 
-on property:sys.powerctl=*
-    powerctl ${sys.powerctl}
-
 on property:sys.boot_completed=1
     bootchart stop
+
+on property:sys.boot_completed=1 && property:ro.build.type=user
+    write /proc/sys/kernel/modules_disabled 1
+
+on property:sys.boot_completed=1 && property:ro.build.type=userdebug
+    write /proc/sys/kernel/modules_disabled 1
 
 # system server cannot write to /proc/sys files,
 # and chown/chmod does not work for /proc/sys/ entries.

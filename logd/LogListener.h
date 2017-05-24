@@ -21,16 +21,16 @@
 #include "LogReader.h"
 
 class LogListener : public SocketListener {
-    LogBuffer *logbuf;
-    LogReader *reader;
+    LogBufferInterface* logbuf;
+    LogReader* reader;
 
-public:
-    LogListener(LogBuffer *buf, LogReader *reader);
+   public:
+    LogListener(LogBufferInterface* buf, LogReader* reader /* nullable */);
 
-protected:
-    virtual bool onDataAvailable(SocketClient *cli);
+   protected:
+    virtual bool onDataAvailable(SocketClient* cli);
 
-private:
+   private:
     static int getLogSocket();
 };
 

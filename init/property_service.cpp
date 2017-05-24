@@ -14,55 +14,50 @@
  * limitations under the License.
  */
 
+#include "property_service.h"
+
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
+#include <netinet/in.h>
+#include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <string.h>
-#include <ctype.h>
-#include <fcntl.h>
-#include <stdarg.h>
-#include <dirent.h>
-#include <limits.h>
-#include <errno.h>
+#include <sys/mman.h>
 #include <sys/poll.h>
-
-#include <memory>
-#include <vector>
-
-#include <cutils/misc.h>
-#include <cutils/sockets.h>
-#include <cutils/multiuser.h>
+#include <sys/select.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 #define _REALLY_INCLUDE_SYS__SYSTEM_PROPERTIES_H_
 #include <sys/_system_properties.h>
 
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/select.h>
-#include <sys/types.h>
-#include <netinet/in.h>
-#include <sys/mman.h>
+#include <memory>
+#include <vector>
 
-#include <selinux/android.h>
-#include <selinux/selinux.h>
-#include <selinux/label.h>
-
-#include <fs_mgr.h>
 #include <android-base/file.h>
+#include <android-base/logging.h>
+#include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
-#include "bootimg.h"
+#include <bootimg.h>
+#include <fs_mgr.h>
+#include <selinux/android.h>
+#include <selinux/label.h>
+#include <selinux/selinux.h>
 
-#include "property_service.h"
 #include "init.h"
 #include "util.h"
-#include "log.h"
 
 using android::base::StringPrintf;
 
 #define PERSISTENT_PROPERTY_DIR  "/data/property"
-#define FSTAB_PREFIX "/fstab."
 #define RECOVERY_MOUNT_POINT "/recovery"
 
 static int persistent_properties_loaded = 0;
@@ -117,12 +112,6 @@ static int check_control_mac_perms(const char *name, char *sctx, struct ucred *c
         return 0;
 
     return check_mac_perms(ctl_name, sctx, cr);
-}
-
-std::string property_get(const char* name) {
-    char value[PROP_VALUE_MAX] = {0};
-    __system_property_get(name, value);
-    return value;
 }
 
 static void write_persistent_property(const char *name, const char *value)
@@ -217,7 +206,7 @@ uint32_t property_set(const std::string& name, const std::string& value) {
     if (persistent_properties_loaded && android::base::StartsWith(name, "persist.")) {
         write_persistent_property(name.c_str(), value.c_str());
     }
-    property_changed(name.c_str(), value.c_str());
+    property_changed(name, value);
     return PROP_SUCCESS;
 }
 
@@ -585,18 +574,33 @@ static void load_persistent_properties() {
     }
 }
 
+// persist.sys.usb.config values can't be combined on build-time when property
+// files are split into each partition.
+// So we need to apply the same rule of build/make/tools/post_process_props.py
+// on runtime.
+static void update_sys_usb_config() {
+    bool is_debuggable = android::base::GetBoolProperty("ro.debuggable", false);
+    std::string config = android::base::GetProperty("persist.sys.usb.config", "");
+    if (config.empty()) {
+        property_set("persist.sys.usb.config", is_debuggable ? "adb" : "none");
+    } else if (is_debuggable && config.find("adb") == std::string::npos &&
+               config.length() + 4 < PROP_VALUE_MAX) {
+        config.append(",adb");
+        property_set("persist.sys.usb.config", config);
+    }
+}
+
 void property_load_boot_defaults() {
     load_properties_from_file("/default.prop", NULL);
     load_properties_from_file("/odm/default.prop", NULL);
     load_properties_from_file("/vendor/default.prop", NULL);
+
+    update_sys_usb_config();
 }
 
 static void load_override_properties() {
     if (ALLOW_LOCAL_PROP_OVERRIDE) {
-        std::string debuggable = property_get("ro.debuggable");
-        if (debuggable == "1") {
-            load_properties_from_file("/data/local.prop", NULL);
-        }
+        load_properties_from_file("/data/local.prop", NULL);
     }
 }
 
@@ -613,21 +617,14 @@ void load_persist_props(void) {
 }
 
 void load_recovery_id_prop() {
-    std::string ro_hardware = property_get("ro.hardware");
-    if (ro_hardware.empty()) {
-        LOG(ERROR) << "ro.hardware not set - unable to load recovery id";
-        return;
-    }
-    std::string fstab_filename = FSTAB_PREFIX + ro_hardware;
-
-    std::unique_ptr<fstab, void(*)(fstab*)> tab(fs_mgr_read_fstab(fstab_filename.c_str()),
-                                                fs_mgr_free_fstab);
-    if (!tab) {
-        PLOG(ERROR) << "unable to read fstab " << fstab_filename;
+    std::unique_ptr<fstab, decltype(&fs_mgr_free_fstab)> fstab(fs_mgr_read_fstab_default(),
+                                                               fs_mgr_free_fstab);
+    if (!fstab) {
+        PLOG(ERROR) << "unable to read default fstab";
         return;
     }
 
-    fstab_rec* rec = fs_mgr_get_entry_for_mount_point(tab.get(), RECOVERY_MOUNT_POINT);
+    fstab_rec* rec = fs_mgr_get_entry_for_mount_point(fstab.get(), RECOVERY_MOUNT_POINT);
     if (rec == NULL) {
         LOG(ERROR) << "/recovery not specified in fstab";
         return;
@@ -662,7 +659,7 @@ void start_property_service() {
     property_set("ro.property_service.version", "2");
 
     property_set_fd = create_socket(PROP_SERVICE_NAME, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
-                                    0666, 0, 0, NULL);
+                                    0666, 0, 0, nullptr, sehandle);
     if (property_set_fd == -1) {
         PLOG(ERROR) << "start_property_service socket creation failed";
         exit(1);

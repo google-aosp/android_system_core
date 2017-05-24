@@ -5,9 +5,27 @@ LOCAL_PATH:= $(call my-dir)
 # --
 
 ifneq (,$(filter userdebug eng,$(TARGET_BUILD_VARIANT)))
-init_options += -DALLOW_LOCAL_PROP_OVERRIDE=1 -DALLOW_PERMISSIVE_SELINUX=1
+init_options += \
+    -DALLOW_LOCAL_PROP_OVERRIDE=1 \
+    -DALLOW_PERMISSIVE_SELINUX=1 \
+    -DREBOOT_BOOTLOADER_ON_PANIC=1 \
+    -DWORLD_WRITABLE_KMSG=1 \
+    -DDUMP_ON_UMOUNT_FAILURE=1
 else
-init_options += -DALLOW_LOCAL_PROP_OVERRIDE=0 -DALLOW_PERMISSIVE_SELINUX=0
+init_options += \
+    -DALLOW_LOCAL_PROP_OVERRIDE=0 \
+    -DALLOW_PERMISSIVE_SELINUX=0 \
+    -DREBOOT_BOOTLOADER_ON_PANIC=0 \
+    -DWORLD_WRITABLE_KMSG=0 \
+    -DDUMP_ON_UMOUNT_FAILURE=0
+endif
+
+ifneq (,$(filter eng,$(TARGET_BUILD_VARIANT)))
+init_options += \
+    -DSHUTDOWN_ZERO_TIMEOUT=1
+else
+init_options += \
+    -DSHUTDOWN_ZERO_TIMEOUT=0
 endif
 
 init_options += -DLOG_UEVENTS=0
@@ -17,6 +35,7 @@ init_cflags += \
     -Wall -Wextra \
     -Wno-unused-parameter \
     -Werror \
+    -std=gnu++1z \
 
 # --
 
@@ -47,6 +66,7 @@ LOCAL_SRC_FILES:= \
     action.cpp \
     capabilities.cpp \
     descriptors.cpp \
+    devices.cpp \
     import_parser.cpp \
     init_parser.cpp \
     log.cpp \
@@ -54,7 +74,7 @@ LOCAL_SRC_FILES:= \
     service.cpp \
     util.cpp \
 
-LOCAL_STATIC_LIBRARIES := libbase libselinux liblog libprocessgroup libnl
+LOCAL_STATIC_LIBRARIES := libbase libselinux liblog libprocessgroup
 LOCAL_WHOLE_STATIC_LIBRARIES := libcap
 LOCAL_MODULE := libinit
 LOCAL_SANITIZE := integer
@@ -66,13 +86,13 @@ LOCAL_CPPFLAGS := $(init_cflags)
 LOCAL_SRC_FILES:= \
     bootchart.cpp \
     builtins.cpp \
-    devices.cpp \
     init.cpp \
+    init_first_stage.cpp \
     keychords.cpp \
     property_service.cpp \
+    reboot.cpp \
     signal_handler.cpp \
     ueventd.cpp \
-    ueventd_parser.cpp \
     watchdogd.cpp \
 
 SYSTEM_CORE_INIT_DEFINES := BOARD_CHARGING_MODE_BOOTING_LPM
@@ -99,8 +119,8 @@ LOCAL_STATIC_LIBRARIES := \
     libfec_rs \
     libsquashfs_utils \
     liblogwrap \
-    libcutils \
     libext4_utils \
+    libcutils \
     libbase \
     libc \
     libselinux \
@@ -112,26 +132,7 @@ LOCAL_STATIC_LIBRARIES := \
     libsparse \
     libz \
     libprocessgroup \
-    libnl \
     libavb
-
-# Include SELinux policy. We do this here because different modules
-# need to be included based on the value of PRODUCT_FULL_TREBLE. This
-# type of conditional inclusion cannot be done in top-level files such
-# as build/target/product/embedded.mk.
-# This conditional inclusion closely mimics the conditional logic
-# inside init/init.cpp for loading SELinux policy from files.
-ifeq ($(PRODUCT_FULL_TREBLE),true)
-# Use split SELinux policy
-LOCAL_REQUIRED_MODULES += \
-    mapping_sepolicy.cil \
-    nonplat_sepolicy.cil \
-    plat_sepolicy.cil \
-    secilc
-else
-# Use monolithic SELinux policy
-LOCAL_REQUIRED_MODULES += sepolicy
-endif
 
 # Create symlinks.
 LOCAL_POST_INSTALL_CMD := $(hide) mkdir -p $(TARGET_ROOT_OUT)/sbin; \
@@ -148,18 +149,22 @@ include $(BUILD_EXECUTABLE)
 include $(CLEAR_VARS)
 LOCAL_MODULE := init_tests
 LOCAL_SRC_FILES := \
+    devices_test.cpp \
     init_parser_test.cpp \
+    init_test.cpp \
     property_service_test.cpp \
+    service_test.cpp \
     util_test.cpp \
 
 LOCAL_SHARED_LIBRARIES += \
-    libcutils \
     libbase \
+    libcutils \
+    libselinux \
 
 LOCAL_STATIC_LIBRARIES := libinit
 LOCAL_SANITIZE := integer
 LOCAL_CLANG := true
-LOCAL_CPPFLAGS := -Wall -Wextra -Werror
+LOCAL_CPPFLAGS := -Wall -Wextra -Werror -std=gnu++1z
 include $(BUILD_NATIVE_TEST)
 
 

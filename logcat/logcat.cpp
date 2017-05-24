@@ -41,6 +41,7 @@
 #include <vector>
 
 #include <android-base/file.h>
+#include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <cutils/sched_policy.h>
@@ -55,6 +56,25 @@
 #include <pcrecpp.h>
 
 #define DEFAULT_MAX_ROTATED_LOGS 4
+
+struct log_device_t {
+    const char* device;
+    bool binary;
+    struct logger* logger;
+    struct logger_list* logger_list;
+    bool printed;
+
+    log_device_t* next;
+
+    log_device_t(const char* d, bool b) {
+        device = d;
+        binary = b;
+        next = nullptr;
+        printed = false;
+        logger = nullptr;
+        logger_list = nullptr;
+    }
+};
 
 struct android_logcat_context_internal {
     // status
@@ -91,15 +111,15 @@ struct android_logcat_context_internal {
     int printBinary;
     int devCount;  // >1 means multiple
     pcrecpp::RE* regex;
+    log_device_t* devices;
+    EventTagMap* eventTagMap;
     // 0 means "infinite"
     size_t maxCount;
     size_t printCount;
+
     bool printItAnyways;
     bool debug;
-
-    // static variables
     bool hasOpenedEventTagMap;
-    EventTagMap* eventTagMap;
 };
 
 // Creates a context associated with this logcat instance
@@ -126,25 +146,6 @@ android_logcat_context create_android_logcat() {
 
 // logd prefixes records with a length field
 #define RECORD_LENGTH_FIELD_SIZE_BYTES sizeof(uint32_t)
-
-struct log_device_t {
-    const char* device;
-    bool binary;
-    struct logger* logger;
-    struct logger_list* logger_list;
-    bool printed;
-
-    log_device_t* next;
-
-    log_device_t(const char* d, bool b) {
-        device = d;
-        binary = b;
-        next = nullptr;
-        printed = false;
-        logger = nullptr;
-        logger_list = nullptr;
-    }
-};
 
 namespace android {
 
@@ -738,7 +739,6 @@ static int __logcat(android_logcat_context_internal* context) {
     const char* setId = nullptr;
     int mode = ANDROID_LOG_RDONLY;
     std::string forceFilters;
-    log_device_t* devices = nullptr;
     log_device_t* dev;
     struct logger_list* logger_list;
     size_t tail_lines = 0;
@@ -882,6 +882,7 @@ static int __logcat(android_logcat_context_internal* context) {
           { "grep",          required_argument, nullptr, 'e' },
           // hidden and undocumented reserved alias for --max-count
           { "head",          required_argument, nullptr, 'm' },
+          { "help",          no_argument,       nullptr, 'h' },
           { id_str,          required_argument, nullptr, 0 },
           { "last",          no_argument,       nullptr, 'L' },
           { "max-count",     required_argument, nullptr, 'm' },
@@ -900,9 +901,8 @@ static int __logcat(android_logcat_context_internal* context) {
         };
         // clang-format on
 
-        ret = getopt_long_r(argc, argv,
-                            ":cdDLt:T:gG:sQf:r:n:v:b:BSpP:m:e:", long_options,
-                            &option_index, &optctx);
+        ret = getopt_long_r(argc, argv, ":cdDhLt:T:gG:sQf:r:n:v:b:BSpP:m:e:",
+                            long_options, &option_index, &optctx);
         if (ret < 0) break;
 
         switch (ret) {
@@ -1117,7 +1117,7 @@ static int __logcat(android_logcat_context_internal* context) {
                     if (!(idMask & (1 << i))) continue;
 
                     bool found = false;
-                    for (dev = devices; dev; dev = dev->next) {
+                    for (dev = context->devices; dev; dev = dev->next) {
                         if (!strcmp(name, dev->device)) {
                             found = true;
                             break;
@@ -1134,7 +1134,7 @@ static int __logcat(android_logcat_context_internal* context) {
                         dev->next = d;
                         dev = d;
                     } else {
-                        devices = dev = d;
+                        context->devices = dev = d;
                     }
                     context->devCount++;
                 }
@@ -1196,39 +1196,71 @@ static int __logcat(android_logcat_context_internal* context) {
             } break;
 
             case 'Q':
-#define KERNEL_OPTION "androidboot.logcat="
+#define LOGCAT_FILTER "androidboot.logcat="
+#define CONSOLE_PIPE_OPTION "androidboot.consolepipe="
 #define CONSOLE_OPTION "androidboot.console="
+#define QEMU_PROPERTY "ro.kernel.qemu"
+#define QEMU_CMDLINE "qemu.cmdline"
                 // This is a *hidden* option used to start a version of logcat
                 // in an emulated device only.  It basically looks for
                 // androidboot.logcat= on the kernel command line.  If
                 // something is found, it extracts a log filter and uses it to
-                // run the program.  If nothing is found, the program should
-                // quit immediately.
+                // run the program. The logcat output will go to consolepipe if
+                // androiboot.consolepipe (e.g. qemu_pipe) is given, otherwise,
+                // it goes to androidboot.console (e.g. tty)
                 {
-                    std::string cmdline;
-                    android::base::ReadFileToString("/proc/cmdline", &cmdline);
-
-                    const char* logcat = strstr(cmdline.c_str(), KERNEL_OPTION);
-                    // if nothing found or invalid filters, exit quietly
-                    if (!logcat) {
+                    // if not in emulator, exit quietly
+                    if (false == android::base::GetBoolProperty(QEMU_PROPERTY, false)) {
                         context->retval = EXIT_SUCCESS;
                         goto exit;
                     }
 
-                    const char* p = logcat + strlen(KERNEL_OPTION);
+                    std::string cmdline = android::base::GetProperty(QEMU_CMDLINE, "");
+                    if (cmdline.empty()) {
+                        android::base::ReadFileToString("/proc/cmdline", &cmdline);
+                    }
+
+                    const char* logcatFilter = strstr(cmdline.c_str(), LOGCAT_FILTER);
+                    // if nothing found or invalid filters, exit quietly
+                    if (!logcatFilter) {
+                        context->retval = EXIT_SUCCESS;
+                        goto exit;
+                    }
+
+                    const char* p = logcatFilter + strlen(LOGCAT_FILTER);
                     const char* q = strpbrk(p, " \t\n\r");
                     if (!q) q = p + strlen(p);
                     forceFilters = std::string(p, q);
 
-                    // redirect our output to the emulator console
+                    // redirect our output to the emulator console pipe or console
+                    const char* consolePipe =
+                        strstr(cmdline.c_str(), CONSOLE_PIPE_OPTION);
                     const char* console =
                         strstr(cmdline.c_str(), CONSOLE_OPTION);
-                    if (!console) break;
 
-                    p = console + strlen(CONSOLE_OPTION);
+                    if (consolePipe) {
+                        p = consolePipe + strlen(CONSOLE_PIPE_OPTION);
+                    } else if (console) {
+                        p = console + strlen(CONSOLE_OPTION);
+                    } else {
+                        context->retval = EXIT_FAILURE;
+                        goto exit;
+                    }
+
                     q = strpbrk(p, " \t\n\r");
                     int len = q ? q - p : strlen(p);
                     std::string devname = "/dev/" + std::string(p, len);
+                    std::string pipePurpose("pipe:logcat");
+                    if (consolePipe) {
+                        // example: "qemu_pipe,pipe:logcat"
+                        // upon opening of /dev/qemu_pipe, the "pipe:logcat"
+                        // string with trailing '\0' should be written to the fd
+                        size_t pos = devname.find(",");
+                        if (pos != std::string::npos) {
+                            pipePurpose = devname.substr(pos + 1);
+                            devname = devname.substr(0, pos);
+                        }
+                    }
                     cmdline.erase();
 
                     if (context->error) {
@@ -1239,6 +1271,16 @@ static int __logcat(android_logcat_context_internal* context) {
                     FILE* fp = fopen(devname.c_str(), "web");
                     devname.erase();
                     if (!fp) break;
+
+                    if (consolePipe) {
+                        // need the trailing '\0'
+                        if(!android::base::WriteFully(fileno(fp), pipePurpose.c_str(),
+                                    pipePurpose.size() + 1)) {
+                            fclose(fp);
+                            context->retval = EXIT_FAILURE;
+                            goto exit;
+                        }
+                    }
 
                     // close output and error channels, replace with console
                     android::close_output(context);
@@ -1260,6 +1302,11 @@ static int __logcat(android_logcat_context_internal* context) {
             case ':':
                 logcat_panic(context, HELP_TRUE,
                              "Option -%c needs an argument\n", optctx.optopt);
+                goto exit;
+
+            case 'h':
+                show_help(context);
+                show_format_help(context);
                 goto exit;
 
             default:
@@ -1287,8 +1334,8 @@ static int __logcat(android_logcat_context_internal* context) {
         context->printItAnyways = false;
     }
 
-    if (!devices) {
-        dev = devices = new log_device_t("main", false);
+    if (!context->devices) {
+        dev = context->devices = new log_device_t("main", false);
         context->devCount = 1;
         if (android_name_to_log_id("system") == LOG_ID_SYSTEM) {
             dev = dev->next = new log_device_t("system", false);
@@ -1384,7 +1431,7 @@ static int __logcat(android_logcat_context_internal* context) {
         }
     }
 
-    dev = devices;
+    dev = context->devices;
     if (tail_time != log_time::EPOCH) {
         logger_list = android_logger_list_alloc_time(mode, tail_time, pid);
     } else {
@@ -1595,7 +1642,7 @@ static int __logcat(android_logcat_context_internal* context) {
         }
 
         log_device_t* d;
-        for (d = devices; d; d = d->next) {
+        for (d = context->devices; d; d = d->next) {
             if (android_name_to_log_id(d->device) == log_msg.id()) break;
         }
         if (!d) {
@@ -1617,6 +1664,11 @@ static int __logcat(android_logcat_context_internal* context) {
     }
 
 close:
+    // Short and sweet. Implemented generic version in android_logcat_destroy.
+    while (!!(dev = context->devices)) {
+        context->devices = dev->next;
+        delete dev;
+    }
     android_logger_list_free(logger_list);
 
 exit:
@@ -1789,6 +1841,20 @@ int android_logcat_destroy(android_logcat_context* ctx) {
     }
 
     android_closeEventTagMap(context->eventTagMap);
+
+    // generic cleanup of devices list to handle all possible dirty cases
+    log_device_t* dev;
+    while (!!(dev = context->devices)) {
+        struct logger_list* logger_list = dev->logger_list;
+        if (logger_list) {
+            for (log_device_t* d = dev; d; d = d->next) {
+                if (d->logger_list == logger_list) d->logger_list = nullptr;
+            }
+            android_logger_list_free(logger_list);
+        }
+        context->devices = dev->next;
+        delete dev;
+    }
 
     int retval = context->retval;
 

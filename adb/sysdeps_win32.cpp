@@ -126,10 +126,7 @@ typedef struct FHRec_
         SOCKET      socket;
     } u;
 
-    int       mask;
-
     char  name[32];
-
 } FHRec;
 
 #define  fh_handle  u.handle
@@ -577,7 +574,6 @@ extern int adb_poll(adb_pollfd* fds, size_t nfds, int timeout) {
 
 static void _fh_socket_init(FH f) {
     f->fh_socket = INVALID_SOCKET;
-    f->mask      = 0;
 }
 
 static int _fh_socket_close( FH  f ) {
@@ -598,7 +594,6 @@ static int _fh_socket_close( FH  f ) {
         }
         f->fh_socket = INVALID_SOCKET;
     }
-    f->mask = 0;
     return 0;
 }
 
@@ -913,6 +908,12 @@ int network_connect(const std::string& host, int port, int type, int timeout, st
     return fd;
 }
 
+int  adb_register_socket(SOCKET s) {
+    FH f = _fh_alloc( &_fh_socket_class );
+    f->fh_socket = s;
+    return _fh_to_int(f);
+}
+
 #undef accept
 int  adb_socket_accept(int  serverfd, struct sockaddr*  addr, socklen_t  *addrlen)
 {
@@ -983,7 +984,7 @@ int adb_getsockname(int fd, struct sockaddr* sockaddr, socklen_t* optlen) {
         return -1;
     }
 
-    int result = (getsockname)(fh->fh_socket, sockaddr, optlen);
+    int result = getsockname(fh->fh_socket, sockaddr, optlen);
     if (result == SOCKET_ERROR) {
         const DWORD err = WSAGetLastError();
         D("adb_getsockname: setsockopt on fd %d failed: %s\n", fd,
@@ -1041,11 +1042,6 @@ int adb_socketpair(int sv[2]) {
     int local_port = -1;
     std::string error;
 
-    struct sockaddr_storage peer_addr = {};
-    struct sockaddr_storage client_addr = {};
-    socklen_t peer_socklen = sizeof(peer_addr);
-    socklen_t client_socklen = sizeof(client_addr);
-
     server = network_loopback_server(0, SOCK_STREAM, &error);
     if (server < 0) {
         D("adb_socketpair: failed to create server: %s", error.c_str());
@@ -1065,32 +1061,12 @@ int adb_socketpair(int sv[2]) {
         goto fail;
     }
 
-    // Make sure that the peer that connected to us and the client are the same.
-    accepted = adb_socket_accept(server, reinterpret_cast<sockaddr*>(&peer_addr), &peer_socklen);
+    accepted = adb_socket_accept(server, nullptr, nullptr);
     if (accepted < 0) {
         D("adb_socketpair: failed to accept: %s", strerror(errno));
         goto fail;
     }
-
-    if (adb_getsockname(client, reinterpret_cast<sockaddr*>(&client_addr), &client_socklen) != 0) {
-        D("adb_socketpair: failed to getpeername: %s", strerror(errno));
-        goto fail;
-    }
-
-    if (peer_socklen != client_socklen) {
-        D("adb_socketpair: client and peer sockaddrs have different lengths");
-        errno = EIO;
-        goto fail;
-    }
-
-    if (memcmp(&peer_addr, &client_addr, peer_socklen) != 0) {
-        D("adb_socketpair: client and peer sockaddrs don't match");
-        errno = EIO;
-        goto fail;
-    }
-
     adb_close(server);
-
     sv[0] = client;
     sv[1] = accepted;
     return 0;
@@ -1113,18 +1089,22 @@ bool set_file_block_mode(int fd, bool block) {
 
     if (!fh || !fh->used) {
         errno = EBADF;
+        D("Setting nonblocking on bad file descriptor %d", fd);
         return false;
     }
 
     if (fh->clazz == &_fh_socket_class) {
         u_long x = !block;
         if (ioctlsocket(fh->u.socket, FIONBIO, &x) != 0) {
-            _socket_set_errno(WSAGetLastError());
+            int error = WSAGetLastError();
+            _socket_set_errno(error);
+            D("Setting %d nonblocking failed (%d)", fd, error);
             return false;
         }
         return true;
     } else {
         errno = ENOTSOCK;
+        D("Setting nonblocking on non-socket %d", fd);
         return false;
     }
 }

@@ -31,6 +31,8 @@
 #include <unistd.h>
 #endif
 
+#include <thread>
+
 #include <android-base/file.h>
 #include <android-base/parsenetaddress.h>
 #include <android-base/stringprintf.h>
@@ -41,7 +43,7 @@
 #include <android-base/properties.h>
 #include <bootloader_message/bootloader_message.h>
 #include <cutils/android_reboot.h>
-#include <private/android_logger.h>
+#include <log/log_properties.h>
 #endif
 
 #include "adb.h"
@@ -259,13 +261,7 @@ static int create_service_thread(void (*func)(int, void *), void *cookie)
     sti->cookie = cookie;
     sti->fd = s[1];
 
-    if (!adb_thread_create(service_bootstrap_func, sti)) {
-        free(sti);
-        adb_close(s[0]);
-        adb_close(s[1]);
-        printf("cannot create service thread\n");
-        return -1;
-    }
+    std::thread(service_bootstrap_func, sti).detach();
 
     D("service thread started, %d:%d",s[0], s[1]);
     return s[0];
@@ -351,7 +347,7 @@ static void wait_for_state(int fd, void* data) {
         std::string error = "unknown error";
         const char* serial = sinfo->serial.length() ? sinfo->serial.c_str() : NULL;
         atransport* t = acquire_one_transport(sinfo->transport_type, serial, &is_ambiguous, &error);
-        if (t != nullptr && (sinfo->state == kCsAny || sinfo->state == t->connection_state)) {
+        if (t != nullptr && (sinfo->state == kCsAny || sinfo->state == t->GetConnectionState())) {
             SendOkay(fd);
             break;
         } else if (!is_ambiguous) {
@@ -375,45 +371,6 @@ static void wait_for_state(int fd, void* data) {
 
     adb_close(fd);
     D("wait_for_state is done");
-}
-
-static void connect_device(const std::string& address, std::string* response) {
-    if (address.empty()) {
-        *response = "empty address";
-        return;
-    }
-
-    std::string serial;
-    std::string host;
-    int port = DEFAULT_ADB_LOCAL_TRANSPORT_PORT;
-    if (!android::base::ParseNetAddress(address, &host, &port, &serial, response)) {
-        return;
-    }
-
-    std::string error;
-    int fd = network_connect(host.c_str(), port, SOCK_STREAM, 10, &error);
-    if (fd == -1) {
-        *response = android::base::StringPrintf("unable to connect to %s: %s",
-                                                serial.c_str(), error.c_str());
-        return;
-    }
-
-    D("client: connected %s remote on fd %d", serial.c_str(), fd);
-    close_on_exec(fd);
-    disable_tcp_nagle(fd);
-
-    // Send a TCP keepalive ping to the device every second so we can detect disconnects.
-    if (!set_tcp_keepalive(fd, 1)) {
-        D("warning: failed to configure TCP keepalives (%s)", strerror(errno));
-    }
-
-    int ret = register_socket_transport(fd, serial.c_str(), port, 0);
-    if (ret < 0) {
-        adb_close(fd);
-        *response = android::base::StringPrintf("already connected to %s", serial.c_str());
-    } else {
-        *response = android::base::StringPrintf("connected to %s", serial.c_str());
-    }
 }
 
 void connect_emulator(const std::string& port_spec, std::string* response) {

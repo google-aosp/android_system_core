@@ -62,12 +62,11 @@ struct DeviceHandleDeleter {
 using unique_device_handle = std::unique_ptr<libusb_device_handle, DeviceHandleDeleter>;
 
 struct transfer_info {
-    transfer_info(const char* name, uint16_t zero_mask) :
-        name(name),
-        transfer(libusb_alloc_transfer(0)),
-        zero_mask(zero_mask)
-    {
-    }
+    transfer_info(const char* name, uint16_t zero_mask, bool is_bulk_out)
+        : name(name),
+          transfer(libusb_alloc_transfer(0)),
+          is_bulk_out(is_bulk_out),
+          zero_mask(zero_mask) {}
 
     ~transfer_info() {
         libusb_free_transfer(transfer);
@@ -75,6 +74,7 @@ struct transfer_info {
 
     const char* name;
     libusb_transfer* transfer;
+    bool is_bulk_out;
     bool transfer_complete;
     std::condition_variable cv;
     std::mutex mutex;
@@ -91,17 +91,17 @@ namespace libusb {
 struct usb_handle : public ::usb_handle {
     usb_handle(const std::string& device_address, const std::string& serial,
                unique_device_handle&& device_handle, uint8_t interface, uint8_t bulk_in,
-               uint8_t bulk_out, size_t zero_mask)
+               uint8_t bulk_out, size_t zero_mask, size_t max_packet_size)
         : device_address(device_address),
           serial(serial),
           closing(false),
           device_handle(device_handle.release()),
-          read("read", zero_mask),
-          write("write", zero_mask),
+          read("read", zero_mask, false),
+          write("write", zero_mask, true),
           interface(interface),
           bulk_in(bulk_in),
-          bulk_out(bulk_out) {
-    }
+          bulk_out(bulk_out),
+          max_packet_size(max_packet_size) {}
 
     ~usb_handle() {
         Close();
@@ -144,6 +144,8 @@ struct usb_handle : public ::usb_handle {
     uint8_t interface;
     uint8_t bulk_in;
     uint8_t bulk_out;
+
+    size_t max_packet_size;
 };
 
 static auto& usb_handles = *new std::unordered_map<std::string, std::unique_ptr<usb_handle>>();
@@ -207,6 +209,7 @@ static void poll_for_devices() {
             size_t interface_num;
             uint16_t zero_mask;
             uint8_t bulk_in = 0, bulk_out = 0;
+            size_t packet_size = 0;
             bool found_adb = false;
 
             for (interface_num = 0; interface_num < config->bNumInterfaces; ++interface_num) {
@@ -253,6 +256,14 @@ static void poll_for_devices() {
                         found_in = true;
                         bulk_in = endpoint_addr;
                     }
+
+                    size_t endpoint_packet_size = endpoint_desc.wMaxPacketSize;
+                    CHECK(endpoint_packet_size != 0);
+                    if (packet_size == 0) {
+                        packet_size = endpoint_packet_size;
+                    } else {
+                        CHECK(packet_size == endpoint_packet_size);
+                    }
                 }
 
                 if (found_in && found_out) {
@@ -281,7 +292,7 @@ static void poll_for_devices() {
             }
 
             libusb_device_handle* handle_raw;
-            rc = libusb_open(list[i], &handle_raw);
+            rc = libusb_open(device, &handle_raw);
             if (rc != 0) {
                 LOG(WARNING) << "failed to open usb device at " << device_address << ": "
                              << libusb_error_name(rc);
@@ -306,14 +317,6 @@ static void poll_for_devices() {
             }
             device_serial.resize(rc);
 
-            // Try to reset the device.
-            rc = libusb_reset_device(handle_raw);
-            if (rc != 0) {
-                LOG(WARNING) << "failed to reset opened device '" << device_serial
-                             << "': " << libusb_error_name(rc);
-                continue;
-            }
-
             // WARNING: this isn't released via RAII.
             rc = libusb_claim_interface(handle.get(), interface_num);
             if (rc != 0) {
@@ -333,9 +336,9 @@ static void poll_for_devices() {
                 }
             }
 
-            auto result =
-                std::make_unique<usb_handle>(device_address, device_serial, std::move(handle),
-                                             interface_num, bulk_in, bulk_out, zero_mask);
+            auto result = std::make_unique<usb_handle>(device_address, device_serial,
+                                                       std::move(handle), interface_num, bulk_in,
+                                                       bulk_out, zero_mask, packet_size);
             usb_handle* usb_handle_raw = result.get();
 
             {
@@ -373,11 +376,6 @@ void usb_init() {
     device_poll_thread = new std::thread(poll_for_devices);
     android::base::at_quick_exit([]() {
         terminate_device_poll_thread = true;
-        std::unique_lock<std::mutex> lock(usb_handles_mutex);
-        for (auto& it : usb_handles) {
-            it.second->Close();
-        }
-        lock.unlock();
         device_poll_thread->join();
     });
 }
@@ -405,7 +403,8 @@ static int perform_usb_transfer(usb_handle* h, transfer_info* info,
             return;
         }
 
-        if (transfer->actual_length != transfer->length) {
+        // usb_read() can return when receiving some data.
+        if (info->is_bulk_out && transfer->actual_length != transfer->length) {
             LOG(DEBUG) << info->name << " transfer incomplete, resubmitting";
             transfer->length -= transfer->actual_length;
             transfer->buffer += transfer->actual_length;
@@ -499,8 +498,12 @@ int usb_read(usb_handle* h, void* d, int len) {
     info->transfer->num_iso_packets = 0;
 
     int rc = perform_usb_transfer(h, info, std::move(lock));
-    LOG(DEBUG) << "usb_read(" << len << ") = " << rc;
-    return rc;
+    LOG(DEBUG) << "usb_read(" << len << ") = " << rc << ", actual_length "
+               << info->transfer->actual_length;
+    if (rc < 0) {
+        return rc;
+    }
+    return info->transfer->actual_length;
 }
 
 int usb_close(usb_handle* h) {
@@ -516,4 +519,10 @@ int usb_close(usb_handle* h) {
 void usb_kick(usb_handle* h) {
     h->Close();
 }
+
+size_t usb_get_max_packet_size(usb_handle* h) {
+    CHECK(h->max_packet_size != 0);
+    return h->max_packet_size;
+}
+
 } // namespace libusb

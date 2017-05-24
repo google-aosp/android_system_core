@@ -47,7 +47,8 @@ class BugreportStandardStreamsCallback : public StandardStreamsCallbackInterface
           invalid_lines_(),
           show_progress_(show_progress),
           status_(0),
-          line_() {
+          line_(),
+          last_progress_percentage_(0) {
         SetLineMessage("generating");
     }
 
@@ -66,6 +67,7 @@ class BugreportStandardStreamsCallback : public StandardStreamsCallbackInterface
     void OnStderr(const char* buffer, int length) {
         OnStream(nullptr, stderr, buffer, length);
     }
+
     int Done(int unused_) {
         // Process remaining line, if any.
         ProcessLine(line_);
@@ -135,7 +137,7 @@ class BugreportStandardStreamsCallback : public StandardStreamsCallbackInterface
             SetSrcFile(&line[strlen(BUGZ_OK_PREFIX)]);
         } else if (android::base::StartsWith(line, BUGZ_FAIL_PREFIX)) {
             const char* error_message = &line[strlen(BUGZ_FAIL_PREFIX)];
-            fprintf(stderr, "Device failed to take a zipped bugreport: %s\n", error_message);
+            fprintf(stderr, "adb: device failed to take a zipped bugreport: %s\n", error_message);
             status_ = -1;
         } else if (show_progress_ && android::base::StartsWith(line, BUGZ_PROGRESS_PREFIX)) {
             // progress_line should have the following format:
@@ -146,7 +148,13 @@ class BugreportStandardStreamsCallback : public StandardStreamsCallbackInterface
             size_t idx2 = line.rfind(BUGZ_PROGRESS_SEPARATOR);
             int progress = std::stoi(line.substr(idx1, (idx2 - idx1)));
             int total = std::stoi(line.substr(idx2 + 1));
-            br_->UpdateProgress(line_message_, progress, total);
+            int progress_percentage = (progress * 100 / total);
+            if (progress_percentage <= last_progress_percentage_) {
+                // Ignore.
+                return;
+            }
+            last_progress_percentage_ = progress_percentage;
+            br_->UpdateProgress(line_message_, progress_percentage);
         } else {
             invalid_lines_.push_back(line);
         }
@@ -180,11 +188,15 @@ class BugreportStandardStreamsCallback : public StandardStreamsCallbackInterface
     // Temporary buffer containing the characters read since the last newline (\n).
     std::string line_;
 
+    // Last displayed progress.
+    // Since dumpstate progress can recede, only forward progress should be displayed
+    int last_progress_percentage_;
+
     DISALLOW_COPY_AND_ASSIGN(BugreportStandardStreamsCallback);
 };
 
 int Bugreport::DoIt(TransportType transport_type, const char* serial, int argc, const char** argv) {
-    if (argc > 2) return usage("usage: adb bugreport [PATH]");
+    if (argc > 2) return syntax_error("adb bugreport [PATH]");
 
     // Gets bugreportz version.
     std::string bugz_stdout, bugz_stderr;
@@ -256,8 +268,7 @@ int Bugreport::DoIt(TransportType transport_type, const char* serial, int argc, 
     return SendShellCommand(transport_type, serial, bugz_command, false, &bugz_callback);
 }
 
-void Bugreport::UpdateProgress(const std::string& message, int progress, int total) {
-    int progress_percentage = (progress * 100 / total);
+void Bugreport::UpdateProgress(const std::string& message, int progress_percentage) {
     line_printer_.Print(
         android::base::StringPrintf("[%3d%%] %s", progress_percentage, message.c_str()),
         LinePrinter::INFO);

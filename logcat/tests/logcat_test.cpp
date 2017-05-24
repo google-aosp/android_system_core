@@ -17,9 +17,11 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/cdefs.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -30,6 +32,7 @@
 
 #include <android-base/file.h>
 #include <gtest/gtest.h>
+#include <log/event_tag_map.h>
 #include <log/log.h>
 #include <log/log_event_list.h>
 
@@ -39,8 +42,22 @@
 #define logcat_pclose(context, fp) pclose(fp)
 #define logcat_system(command) system(command)
 #endif
+#ifndef logcat_executable
+#define USING_LOGCAT_EXECUTABLE_DEFAULT
+#define logcat_executable "logcat"
+#endif
 
 #define BIG_BUFFER (5 * 1024)
+
+// rest(), let the logs settle.
+//
+// logd is in a background cgroup and under extreme load can take up to
+// 3 seconds to land a log entry. Under moderate load we can do with 200ms.
+static void rest() {
+    static const useconds_t restPeriod = 200000;
+
+    usleep(restPeriod);
+}
 
 // enhanced version of LOG_FAILURE_RETRY to add support for EAGAIN and
 // non-syscall libs. Since we are only using this in the emergency of
@@ -64,14 +81,13 @@ TEST(logcat, buckets) {
 
 #undef LOG_TAG
 #define LOG_TAG "inject"
-    RLOGE("logcat.buckets");
-    sleep(1);
+    RLOGE(logcat_executable ".buckets");
+    rest();
 
-    ASSERT_TRUE(
-        NULL !=
-        (fp = logcat_popen(
-             ctx,
-             "logcat -b radio -b events -b system -b main -d 2>/dev/null")));
+    ASSERT_TRUE(NULL !=
+                (fp = logcat_popen(
+                     ctx, logcat_executable
+                     " -b radio -b events -b system -b main -d 2>/dev/null")));
 
     char buffer[BIG_BUFFER];
 
@@ -101,8 +117,8 @@ TEST(logcat, event_tag_filter) {
     logcat_define(ctx);
 
     ASSERT_TRUE(NULL !=
-                (fp = logcat_popen(ctx,
-                                   "logcat -b events -d -s auditd "
+                (fp = logcat_popen(ctx, logcat_executable
+                                   " -b events -d -s auditd "
                                    "am_proc_start am_pss am_proc_bound "
                                    "dvm_lock_sample am_wtf 2>/dev/null")));
 
@@ -170,10 +186,9 @@ TEST(logcat, year) {
 #endif
         strftime(needle, sizeof(needle), "[ %Y-", ptm);
 
-        ASSERT_TRUE(
-            NULL !=
-            (fp = logcat_popen(
-                 ctx, "logcat -v long -v year -b all -t 3 2>/dev/null")));
+        ASSERT_TRUE(NULL != (fp = logcat_popen(
+                                 ctx, logcat_executable
+                                 " -v long -v year -b all -t 3 2>/dev/null")));
 
         char buffer[BIG_BUFFER];
 
@@ -208,9 +223,9 @@ static char* fgetLongTime(char* buffer, size_t buflen, FILE* fp) {
         if ((*ep != '-') && (*ep != '.')) {
             continue;
         }
-        // Find PID field
+        // Find PID field.  Look for ': ' or ':[0-9][0-9][0-9]'
         while (((ep = strchr(ep, ':'))) && (*++ep != ' ')) {
-            ;
+            if (isdigit(ep[0]) && isdigit(ep[1]) && isdigit(ep[2])) break;
         }
         if (!ep) {
             continue;
@@ -237,8 +252,8 @@ TEST(logcat, tz) {
         logcat_define(ctx);
 
         ASSERT_TRUE(NULL !=
-                    (fp = logcat_popen(ctx,
-                                       "logcat -v long -v America/Los_Angeles "
+                    (fp = logcat_popen(ctx, logcat_executable
+                                       " -v long -v America/Los_Angeles "
                                        "-b all -t 3 2>/dev/null")));
 
         char buffer[BIG_BUFFER];
@@ -264,10 +279,9 @@ TEST(logcat, ntz) {
     FILE* fp;
     logcat_define(ctx);
 
-    ASSERT_TRUE(NULL !=
-                (fp = logcat_popen(ctx,
-                                   "logcat -v long -v America/Los_Angeles -v "
-                                   "zone -b all -t 3 2>/dev/null")));
+    ASSERT_TRUE(NULL != (fp = logcat_popen(ctx, logcat_executable
+                                           " -v long -v America/Los_Angeles -v "
+                                           "zone -b all -t 3 2>/dev/null")));
 
     char buffer[BIG_BUFFER];
 
@@ -329,7 +343,7 @@ TEST(logcat, tail_1000) {
     do_tail(1000);
 }
 
-TEST(logcat, tail_time) {
+static void do_tail_time(const char* cmd) {
     FILE* fp;
     int count;
     char buffer[BIG_BUFFER];
@@ -343,14 +357,9 @@ TEST(logcat, tail_time) {
     int tries = 4;  // in case run too soon after system start or buffer clear
 
     do {
+        snprintf(buffer, sizeof(buffer), "%s -t 10 2>&1", cmd);
         logcat_define(ctx);
-        ASSERT_TRUE(NULL != (fp = logcat_popen(ctx,
-                                               "logcat"
-                                               " -v long"
-                                               " -v nsec"
-                                               " -b all"
-                                               " -t 10"
-                                               " 2>&1")));
+        ASSERT_TRUE(NULL != (fp = logcat_popen(ctx, buffer)));
         count = 0;
 
         while ((input = fgetLongTime(buffer, sizeof(buffer), fp))) {
@@ -372,14 +381,7 @@ TEST(logcat, tail_time) {
     EXPECT_TRUE(first_timestamp != NULL);
     EXPECT_TRUE(second_timestamp != NULL);
 
-    snprintf(buffer, sizeof(buffer),
-             "logcat"
-             " -v long"
-             " -v nsec"
-             " -b all"
-             " -t '%s'"
-             " 2>&1",
-             first_timestamp);
+    snprintf(buffer, sizeof(buffer), "%s -t '%s' 2>&1", cmd, first_timestamp);
     logcat_define(ctx);
     ASSERT_TRUE(NULL != (fp = logcat_popen(ctx, buffer)));
 
@@ -446,6 +448,14 @@ TEST(logcat, tail_time) {
     EXPECT_LE(count, last_timestamp_count);
 }
 
+TEST(logcat, tail_time) {
+    do_tail_time(logcat_executable " -v long -v nsec -b all");
+}
+
+TEST(logcat, tail_time_epoch) {
+    do_tail_time(logcat_executable " -v long -v nsec -v epoch -b all");
+}
+
 TEST(logcat, End_to_End) {
     pid_t pid = getpid();
 
@@ -456,8 +466,8 @@ TEST(logcat, End_to_End) {
     FILE* fp;
     logcat_define(ctx);
     ASSERT_TRUE(NULL !=
-                (fp = logcat_popen(
-                     ctx, "logcat -v brief -b events -t 100 2>/dev/null")));
+                (fp = logcat_popen(ctx, logcat_executable
+                                   " -v brief -b events -t 100 2>/dev/null")));
 
     char buffer[BIG_BUFFER];
 
@@ -481,6 +491,56 @@ TEST(logcat, End_to_End) {
     logcat_pclose(ctx, fp);
 
     ASSERT_EQ(1, count);
+}
+
+TEST(logcat, End_to_End_multitude) {
+    pid_t pid = getpid();
+
+    log_time ts(CLOCK_MONOTONIC);
+
+    ASSERT_LT(0, __android_log_btwrite(0, EVENT_TYPE_LONG, &ts, sizeof(ts)));
+
+    FILE* fp[256];  // does this count as a multitude!
+    memset(fp, 0, sizeof(fp));
+    logcat_define(ctx[sizeof(fp) / sizeof(fp[0])]);
+    size_t num = 0;
+    do {
+        EXPECT_TRUE(NULL !=
+                    (fp[num] = logcat_popen(ctx[num], logcat_executable
+                                            " -v brief -b events -t 100")));
+        if (!fp[num]) {
+            fprintf(stderr,
+                    "WARNING: limiting to %zu simultaneous logcat operations\n",
+                    num);
+            break;
+        }
+    } while (++num < sizeof(fp) / sizeof(fp[0]));
+
+    char buffer[BIG_BUFFER];
+
+    size_t count = 0;
+
+    for (size_t idx = 0; idx < sizeof(fp) / sizeof(fp[0]); ++idx) {
+        if (!fp[idx]) break;
+        while (fgets(buffer, sizeof(buffer), fp[idx])) {
+            int p;
+            unsigned long long t;
+
+            if ((2 != sscanf(buffer, "I/[0]     ( %d): %llu", &p, &t)) ||
+                (p != pid)) {
+                continue;
+            }
+
+            log_time tx((const char*)&t);
+            if (ts == tx) {
+                ++count;
+            }
+        }
+
+        logcat_pclose(ctx[idx], fp[idx]);
+    }
+
+    ASSERT_EQ(num, count);
 }
 
 static int get_groups(const char* cmd) {
@@ -558,22 +618,23 @@ static int get_groups(const char* cmd) {
 }
 
 TEST(logcat, get_size) {
-    ASSERT_EQ(4, get_groups("logcat -v brief -b radio -b events -b system -b "
+    ASSERT_EQ(4, get_groups(logcat_executable
+                            " -v brief -b radio -b events -b system -b "
                             "main -g 2>/dev/null"));
 }
 
 // duplicate test for get_size, but use comma-separated list of buffers
 TEST(logcat, multiple_buffer) {
     ASSERT_EQ(
-        4, get_groups(
-               "logcat -v brief -b radio,events,system,main -g 2>/dev/null"));
+        4, get_groups(logcat_executable
+                      " -v brief -b radio,events,system,main -g 2>/dev/null"));
 }
 
 TEST(logcat, bad_buffer) {
-    ASSERT_EQ(
-        0,
-        get_groups(
-            "logcat -v brief -b radio,events,bogo,system,main -g 2>/dev/null"));
+    ASSERT_EQ(0,
+              get_groups(
+                  logcat_executable
+                  " -v brief -b radio,events,bogo,system,main -g 2>/dev/null"));
 }
 
 #ifndef logcat
@@ -728,8 +789,8 @@ TEST(logcat, logrotate) {
     char buf[sizeof(form)];
     ASSERT_TRUE(NULL != mkdtemp(strcpy(buf, form)));
 
-    static const char comm[] =
-        "logcat -b radio -b events -b system -b main"
+    static const char comm[] = logcat_executable
+        " -b radio -b events -b system -b main"
         " -d -f %s/log.txt -n 7 -r 1";
     char command[sizeof(buf) + sizeof(comm)];
     snprintf(command, sizeof(command), comm, buf);
@@ -774,8 +835,8 @@ TEST(logcat, logrotate_suffix) {
     char tmp_out_dir[sizeof(tmp_out_dir_form)];
     ASSERT_TRUE(NULL != mkdtemp(strcpy(tmp_out_dir, tmp_out_dir_form)));
 
-    static const char logcat_cmd[] =
-        "logcat -b radio -b events -b system -b main"
+    static const char logcat_cmd[] = logcat_executable
+        " -b radio -b events -b system -b main"
         " -d -f %s/log.txt -n 10 -r 1";
     char command[sizeof(tmp_out_dir) + sizeof(logcat_cmd)];
     snprintf(command, sizeof(command), logcat_cmd, tmp_out_dir);
@@ -834,7 +895,7 @@ TEST(logcat, logrotate_continue) {
 
     static const char log_filename[] = "log.txt";
     static const char logcat_cmd[] =
-        "logcat -b all -v nsec -d -f %s/%s -n 256 -r 1024";
+        logcat_executable " -b all -v nsec -d -f %s/%s -n 256 -r 1024";
     static const char cleanup_cmd[] = "rm -rf %s";
     char command[sizeof(tmp_out_dir) + sizeof(logcat_cmd) + sizeof(log_filename)];
     snprintf(command, sizeof(command), logcat_cmd, tmp_out_dir, log_filename);
@@ -959,7 +1020,8 @@ TEST(logcat, logrotate_clear) {
 
     static const char log_filename[] = "log.txt";
     static const unsigned num_val = 32;
-    static const char logcat_cmd[] = "logcat -b all -d -f %s/%s -n %d -r 1";
+    static const char logcat_cmd[] =
+        logcat_executable " -b all -d -f %s/%s -n %d -r 1";
     static const char clear_cmd[] = " -c";
     static const char cleanup_cmd[] = "rm -rf %s";
     char command[sizeof(tmp_out_dir) + sizeof(logcat_cmd) +
@@ -1063,9 +1125,9 @@ static int logrotate_count_id(const char* logcat_cmd, const char* tmp_out_dir) {
 
 TEST(logcat, logrotate_id) {
     static const char logcat_cmd[] =
-        "logcat -b all -d -f %s/%s -n 32 -r 1 --id=test";
+        logcat_executable " -b all -d -f %s/%s -n 32 -r 1 --id=test";
     static const char logcat_short_cmd[] =
-        "logcat -b all -t 10 -f %s/%s -n 32 -r 1 --id=test";
+        logcat_executable " -b all -t 10 -f %s/%s -n 32 -r 1 --id=test";
     static const char tmp_out_dir_form[] =
         "/data/local/tmp/logcat.logrotate.XXXXXX";
     static const char log_filename[] = "log.txt";
@@ -1109,8 +1171,8 @@ TEST(logcat, logrotate_id) {
 
 TEST(logcat, logrotate_nodir) {
     // expect logcat to error out on writing content and not exit(0) for nodir
-    static const char command[] =
-        "logcat -b all -d"
+    static const char command[] = logcat_executable
+        " -b all -d"
         " -f /das/nein/gerfingerpoken/logcat/log.txt"
         " -n 256 -r 1024";
     EXPECT_FALSE(IsFalse(0 == logcat_system(command), command));
@@ -1154,7 +1216,12 @@ TEST(logcat, blocking_clear) {
     signal(SIGALRM, caught_blocking_clear);
     alarm(2);
     while (fgets(buffer, sizeof(buffer), fp)) {
-        if (!strncmp(buffer, "clearLog: ", 10)) {
+        if (!strncmp(buffer, "clearLog: ", strlen("clearLog: "))) {
+            fprintf(stderr, "WARNING: Test lacks permission to run :-(\n");
+            count = signals = 1;
+            break;
+        }
+        if (!strncmp(buffer, "failed to clear", strlen("failed to clear"))) {
             fprintf(stderr, "WARNING: Test lacks permission to run :-(\n");
             count = signals = 1;
             break;
@@ -1246,7 +1313,7 @@ static bool get_white_black(char** list) {
     FILE* fp;
     logcat_define(ctx);
 
-    fp = logcat_popen(ctx, "logcat -p 2>/dev/null");
+    fp = logcat_popen(ctx, logcat_executable " -p 2>/dev/null");
     if (fp == NULL) {
         fprintf(stderr, "ERROR: logcat -p 2>/dev/null\n");
         return false;
@@ -1284,7 +1351,8 @@ static bool set_white_black(const char* list) {
 
     char buffer[BIG_BUFFER];
 
-    snprintf(buffer, sizeof(buffer), "logcat -P '%s' 2>&1", list ? list : "");
+    snprintf(buffer, sizeof(buffer), logcat_executable " -P '%s' 2>&1",
+             list ? list : "");
     fp = logcat_popen(ctx, buffer);
     if (fp == NULL) {
         fprintf(stderr, "ERROR: %s\n", buffer);
@@ -1346,15 +1414,11 @@ TEST(logcat, regex) {
     int count = 0;
 
     char buffer[BIG_BUFFER];
-// Have to make liblogcat data unique from logcat data injection
-#ifdef logcat
-#define logcat_regex_prefix "lolcat_test"
-#else
-#define logcat_regex_prefix "logcat_test"
-#endif
+#define logcat_regex_prefix ___STRING(logcat) "_test"
 
     snprintf(buffer, sizeof(buffer),
-             "logcat --pid %d -d -e " logcat_regex_prefix "_a+b", getpid());
+             logcat_executable " --pid %d -d -e " logcat_regex_prefix "_a+b",
+             getpid());
 
     LOG_FAILURE_RETRY(__android_log_print(ANDROID_LOG_WARN, logcat_regex_prefix,
                                           logcat_regex_prefix "_ab"));
@@ -1365,7 +1429,7 @@ TEST(logcat, regex) {
     LOG_FAILURE_RETRY(__android_log_print(ANDROID_LOG_WARN, logcat_regex_prefix,
                                           logcat_regex_prefix "_aaaa"));
     // Let the logs settle
-    sleep(1);
+    rest();
 
     ASSERT_TRUE(NULL != (fp = logcat_popen(ctx, buffer)));
 
@@ -1391,8 +1455,8 @@ TEST(logcat, maxcount) {
 
     char buffer[BIG_BUFFER];
 
-    snprintf(buffer, sizeof(buffer), "logcat --pid %d -d --max-count 3",
-             getpid());
+    snprintf(buffer, sizeof(buffer),
+             logcat_executable " --pid %d -d --max-count 3", getpid());
 
     LOG_FAILURE_RETRY(
         __android_log_print(ANDROID_LOG_WARN, "logcat_test", "logcat_test"));
@@ -1403,8 +1467,7 @@ TEST(logcat, maxcount) {
     LOG_FAILURE_RETRY(
         __android_log_print(ANDROID_LOG_WARN, "logcat_test", "logcat_test"));
 
-    // Let the logs settle
-    sleep(1);
+    rest();
 
     ASSERT_TRUE(NULL != (fp = logcat_popen(ctx, buffer)));
 
@@ -1429,8 +1492,7 @@ static bool End_to_End(const char* tag, const char* fmt, ...)
 
 static bool End_to_End(const char* tag, const char* fmt, ...) {
     logcat_define(ctx);
-    FILE* fp = logcat_popen(ctx,
-                            "logcat"
+    FILE* fp = logcat_popen(ctx, logcat_executable
                             " -v brief"
                             " -b events"
                             " -v descriptive"
@@ -1476,13 +1538,12 @@ static bool End_to_End(const char* tag, const char* fmt, ...) {
         // Help us pinpoint where things went wrong ...
         fprintf(stderr, "Closest match for\n    %s\n  is\n    %s",
                 expect.c_str(), lastMatch.c_str());
-    } else if (count > 2) {
+    } else if (count > 3) {
         fprintf(stderr, "Too many matches (%d) for %s\n", count, expect.c_str());
     }
 
-    // Expect one the first time around as either liblogcat.descriptive or
-    // logcat.descriptive.  Expect two the second time as the other.
-    return count == 1 || count == 2;
+    // Three different known tests, we can see pollution from the others
+    return count && (count <= 3);
 }
 
 TEST(logcat, descriptive) {
@@ -1490,24 +1551,28 @@ TEST(logcat, descriptive) {
         uint32_t tagNo;
         const char* tagStr;
     };
+    int ret;
 
     {
         static const struct tag hhgtg = { 42, "answer" };
         android_log_event_list ctx(hhgtg.tagNo);
         static const char theAnswer[] = "what is five by seven";
         ctx << theAnswer;
-        ctx.write();
+        // crafted to rest at least once after, and rest between retries.
+        for (ret = -EBUSY; ret == -EBUSY; rest()) ret = ctx.write();
+        EXPECT_LE(0, ret);
         EXPECT_TRUE(
             End_to_End(hhgtg.tagStr, "to life the universe etc=%s", theAnswer));
     }
 
     {
         static const struct tag sync = { 2720, "sync" };
-        static const char id[] = "logcat.decriptive";
+        static const char id[] = ___STRING(logcat) ".descriptive-sync";
         {
             android_log_event_list ctx(sync.tagNo);
             ctx << id << (int32_t)42 << (int32_t)-1 << (int32_t)0;
-            ctx.write();
+            for (ret = -EBUSY; ret == -EBUSY; rest()) ret = ctx.write();
+            EXPECT_LE(0, ret);
             EXPECT_TRUE(End_to_End(sync.tagStr,
                                    "[id=%s,event=42,source=-1,account=0]", id));
         }
@@ -1516,7 +1581,8 @@ TEST(logcat, descriptive) {
         {
             android_log_event_list ctx(sync.tagNo);
             ctx << id << (int32_t)43 << (int64_t)-1 << (int32_t)0;
-            ctx.write();
+            for (ret = -EBUSY; ret == -EBUSY; rest()) ret = ctx.write();
+            EXPECT_LE(0, ret);
             EXPECT_TRUE(End_to_End(sync.tagStr, "[id=%s,event=43,-1,0]", id));
         }
 
@@ -1524,7 +1590,8 @@ TEST(logcat, descriptive) {
         {
             android_log_event_list ctx(sync.tagNo);
             ctx << id << (int32_t)44 << (int32_t)-1 << (int64_t)0;
-            ctx.write();
+            for (ret = -EBUSY; ret == -EBUSY; rest()) ret = ctx.write();
+            EXPECT_LE(0, ret);
             fprintf(stderr, "Expect a \"Closest match\" message\n");
             EXPECT_FALSE(End_to_End(
                 sync.tagStr, "[id=%s,event=44,source=-1,account=0]", id));
@@ -1536,7 +1603,8 @@ TEST(logcat, descriptive) {
         {
             android_log_event_list ctx(sync.tagNo);
             ctx << (uint64_t)30 << (int32_t)2;
-            ctx.write();
+            for (ret = -EBUSY; ret == -EBUSY; rest()) ret = ctx.write();
+            EXPECT_LE(0, ret);
             EXPECT_TRUE(
                 End_to_End(sync.tagStr, "[aggregation time=30ms,count=2]"));
         }
@@ -1544,7 +1612,8 @@ TEST(logcat, descriptive) {
         {
             android_log_event_list ctx(sync.tagNo);
             ctx << (uint64_t)31570 << (int32_t)911;
-            ctx.write();
+            for (ret = -EBUSY; ret == -EBUSY; rest()) ret = ctx.write();
+            EXPECT_LE(0, ret);
             EXPECT_TRUE(
                 End_to_End(sync.tagStr, "[aggregation time=31.57s,count=911]"));
         }
@@ -1555,42 +1624,48 @@ TEST(logcat, descriptive) {
         {
             android_log_event_list ctx(sync.tagNo);
             ctx << (uint32_t)512;
-            ctx.write();
+            for (ret = -EBUSY; ret == -EBUSY; rest()) ret = ctx.write();
+            EXPECT_LE(0, ret);
             EXPECT_TRUE(End_to_End(sync.tagStr, "current=512B"));
         }
 
         {
             android_log_event_list ctx(sync.tagNo);
             ctx << (uint32_t)3072;
-            ctx.write();
+            for (ret = -EBUSY; ret == -EBUSY; rest()) ret = ctx.write();
+            EXPECT_LE(0, ret);
             EXPECT_TRUE(End_to_End(sync.tagStr, "current=3KB"));
         }
 
         {
             android_log_event_list ctx(sync.tagNo);
             ctx << (uint32_t)2097152;
-            ctx.write();
+            for (ret = -EBUSY; ret == -EBUSY; rest()) ret = ctx.write();
+            EXPECT_LE(0, ret);
             EXPECT_TRUE(End_to_End(sync.tagStr, "current=2MB"));
         }
 
         {
             android_log_event_list ctx(sync.tagNo);
             ctx << (uint32_t)2097153;
-            ctx.write();
+            for (ret = -EBUSY; ret == -EBUSY; rest()) ret = ctx.write();
+            EXPECT_LE(0, ret);
             EXPECT_TRUE(End_to_End(sync.tagStr, "current=2097153B"));
         }
 
         {
             android_log_event_list ctx(sync.tagNo);
             ctx << (uint32_t)1073741824;
-            ctx.write();
+            for (ret = -EBUSY; ret == -EBUSY; rest()) ret = ctx.write();
+            EXPECT_LE(0, ret);
             EXPECT_TRUE(End_to_End(sync.tagStr, "current=1GB"));
         }
 
         {
             android_log_event_list ctx(sync.tagNo);
             ctx << (uint32_t)3221225472;  // 3MB, but on purpose overflowed
-            ctx.write();
+            for (ret = -EBUSY; ret == -EBUSY; rest()) ret = ctx.write();
+            EXPECT_LE(0, ret);
             EXPECT_TRUE(End_to_End(sync.tagStr, "current=-1GB"));
         }
     }
@@ -1598,8 +1673,51 @@ TEST(logcat, descriptive) {
     {
         static const struct tag sync = { 27501, "notification_panel_hidden" };
         android_log_event_list ctx(sync.tagNo);
-        ctx.write();
+        for (ret = -EBUSY; ret == -EBUSY; rest()) ret = ctx.write();
+        EXPECT_LE(0, ret);
         EXPECT_TRUE(End_to_End(sync.tagStr, ""));
+    }
+
+    {
+        // Invent new entries because existing can not serve
+        EventTagMap* map = android_openEventTagMap(nullptr);
+        ASSERT_TRUE(nullptr != map);
+        static const char name[] = ___STRING(logcat) ".descriptive-monotonic";
+        int myTag = android_lookupEventTagNum(map, name, "(new|1|s)",
+                                              ANDROID_LOG_UNKNOWN);
+        android_closeEventTagMap(map);
+        ASSERT_NE(-1, myTag);
+
+        const struct tag sync = { (uint32_t)myTag, name };
+
+        {
+            android_log_event_list ctx(sync.tagNo);
+            ctx << (uint32_t)7;
+            for (ret = -EBUSY; ret == -EBUSY; rest()) ret = ctx.write();
+            EXPECT_LE(0, ret);
+            EXPECT_TRUE(End_to_End(sync.tagStr, "new=7s"));
+        }
+        {
+            android_log_event_list ctx(sync.tagNo);
+            ctx << (uint32_t)62;
+            for (ret = -EBUSY; ret == -EBUSY; rest()) ret = ctx.write();
+            EXPECT_LE(0, ret);
+            EXPECT_TRUE(End_to_End(sync.tagStr, "new=1:02"));
+        }
+        {
+            android_log_event_list ctx(sync.tagNo);
+            ctx << (uint32_t)3673;
+            for (ret = -EBUSY; ret == -EBUSY; rest()) ret = ctx.write();
+            EXPECT_LE(0, ret);
+            EXPECT_TRUE(End_to_End(sync.tagStr, "new=1:01:13"));
+        }
+        {
+            android_log_event_list ctx(sync.tagNo);
+            ctx << (uint32_t)(86400 + 7200 + 180 + 58);
+            for (ret = -EBUSY; ret == -EBUSY; rest()) ret = ctx.write();
+            EXPECT_LE(0, ret);
+            EXPECT_TRUE(End_to_End(sync.tagStr, "new=1d 2:03:58"));
+        }
     }
 }
 
@@ -1617,8 +1735,34 @@ static bool reportedSecurity(const char* command) {
 }
 
 TEST(logcat, security) {
-    EXPECT_FALSE(reportedSecurity("logcat -b all -g 2>&1"));
-    EXPECT_TRUE(reportedSecurity("logcat -b security -g 2>&1"));
-    EXPECT_TRUE(reportedSecurity("logcat -b security -c 2>&1"));
-    EXPECT_TRUE(reportedSecurity("logcat -b security -G 256K 2>&1"));
+    EXPECT_FALSE(reportedSecurity(logcat_executable " -b all -g 2>&1"));
+    EXPECT_TRUE(reportedSecurity(logcat_executable " -b security -g 2>&1"));
+    EXPECT_TRUE(reportedSecurity(logcat_executable " -b security -c 2>&1"));
+    EXPECT_TRUE(
+        reportedSecurity(logcat_executable " -b security -G 256K 2>&1"));
+}
+
+static size_t commandOutputSize(const char* command) {
+    logcat_define(ctx);
+    FILE* fp = logcat_popen(ctx, command);
+    if (!fp) return 0;
+
+    std::string ret;
+    if (!android::base::ReadFdToString(fileno(fp), &ret)) return 0;
+    if (logcat_pclose(ctx, fp) != 0) return 0;
+
+    return ret.size();
+}
+
+TEST(logcat, help) {
+    size_t logcatHelpTextSize = commandOutputSize(logcat_executable " -h 2>&1");
+    EXPECT_LT(4096UL, logcatHelpTextSize);
+    size_t logcatLastHelpTextSize =
+        commandOutputSize(logcat_executable " -L -h 2>&1");
+#ifdef USING_LOGCAT_EXECUTABLE_DEFAULT  // logcat and liblogcat
+    EXPECT_EQ(logcatHelpTextSize, logcatLastHelpTextSize);
+#else
+    // logcatd -L -h prints the help twice, as designed.
+    EXPECT_EQ(logcatHelpTextSize * 2, logcatLastHelpTextSize);
+#endif
 }

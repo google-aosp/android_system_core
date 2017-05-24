@@ -35,9 +35,19 @@
 
 using namespace android;
 
-// Periodic chores intervals in seconds
-#define DEFAULT_PERIODIC_CHORES_INTERVAL_FAST (60 * 1)
-#define DEFAULT_PERIODIC_CHORES_INTERVAL_SLOW (60 * 10)
+#ifndef BOARD_PERIODIC_CHORES_INTERVAL_FAST
+  // Periodic chores fast interval in seconds
+  #define DEFAULT_PERIODIC_CHORES_INTERVAL_FAST (60 * 1)
+#else
+  #define DEFAULT_PERIODIC_CHORES_INTERVAL_FAST (BOARD_PERIODIC_CHORES_INTERVAL_FAST)
+#endif
+
+#ifndef BOARD_PERIODIC_CHORES_INTERVAL_SLOW
+  // Periodic chores fast interval in seconds
+  #define DEFAULT_PERIODIC_CHORES_INTERVAL_SLOW (60 * 10)
+#else
+  #define DEFAULT_PERIODIC_CHORES_INTERVAL_SLOW (BOARD_PERIODIC_CHORES_INTERVAL_SLOW)
+#endif
 
 static struct healthd_config healthd_config = {
     .periodic_chores_interval_fast = DEFAULT_PERIODIC_CHORES_INTERVAL_FAST,
@@ -143,10 +153,14 @@ static void healthd_mode_nop_battery_update(
     struct android::BatteryProperties* /*props*/) {
 }
 
-int healthd_register_event(int fd, void (*handler)(uint32_t)) {
+int healthd_register_event(int fd, void (*handler)(uint32_t), EventWakeup wakeup) {
     struct epoll_event ev;
 
-    ev.events = EPOLLIN | EPOLLWAKEUP;
+    ev.events = EPOLLIN;
+
+    if (wakeup == EVENT_WAKEUP_FD)
+        ev.events |= EPOLLWAKEUP;
+
     ev.data.ptr = (void *)handler;
     if (epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &ev) == -1) {
         KLOG_ERROR(LOG_TAG,
@@ -252,7 +266,7 @@ static void uevent_init(void) {
     }
 
     fcntl(uevent_fd, F_SETFL, O_NONBLOCK);
-    if (healthd_register_event(uevent_fd, uevent_event))
+    if (healthd_register_event(uevent_fd, uevent_event, EVENT_WAKEUP_FD))
         KLOG_ERROR(LOG_TAG,
                    "register for uevent events failed\n");
 }
@@ -275,7 +289,7 @@ static void wakealarm_init(void) {
         return;
     }
 
-    if (healthd_register_event(wakealarm_fd, wakealarm_event))
+    if (healthd_register_event(wakealarm_fd, wakealarm_event, EVENT_WAKEUP_FD))
         KLOG_ERROR(LOG_TAG,
                    "Registration of wakealarm event failed\n");
 
@@ -283,17 +297,22 @@ static void wakealarm_init(void) {
 }
 
 static void healthd_mainloop(void) {
+    int nevents = 0;
     while (1) {
         struct epoll_event events[eventct];
-        int nevents;
         int timeout = awake_poll_interval;
         int mode_timeout;
+
+        /* Don't wait for first timer timeout to run periodic chores */
+        if (!nevents)
+            periodic_chores();
+
+        healthd_mode_ops->heartbeat();
 
         mode_timeout = healthd_mode_ops->preparetowait();
         if (timeout < 0 || (mode_timeout > 0 && mode_timeout < timeout))
             timeout = mode_timeout;
         nevents = epoll_wait(epollfd, events, eventct, timeout);
-
         if (nevents == -1) {
             if (errno == EINTR)
                 continue;
@@ -305,11 +324,6 @@ static void healthd_mainloop(void) {
             if (events[n].data.ptr)
                 (*(void (*)(int))events[n].data.ptr)(events[n].events);
         }
-
-        if (!nevents)
-            periodic_chores();
-
-        healthd_mode_ops->heartbeat();
     }
 
     return;

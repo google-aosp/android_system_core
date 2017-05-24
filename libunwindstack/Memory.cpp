@@ -48,14 +48,40 @@ bool Memory::ReadString(uint64_t addr, std::string* string, uint64_t max_read) {
   return false;
 }
 
+bool MemoryBuffer::Read(uint64_t addr, void* dst, size_t size) {
+  uint64_t last_read_byte;
+  if (__builtin_add_overflow(size, addr, &last_read_byte)) {
+    return false;
+  }
+  if (last_read_byte > raw_.size()) {
+    return false;
+  }
+  memcpy(dst, &raw_[addr], size);
+  return true;
+}
+
+uint8_t* MemoryBuffer::GetPtr(size_t offset) {
+  if (offset < raw_.size()) {
+    return &raw_[offset];
+  }
+  return nullptr;
+}
+
 MemoryFileAtOffset::~MemoryFileAtOffset() {
+  Clear();
+}
+
+void MemoryFileAtOffset::Clear() {
   if (data_) {
     munmap(&data_[-offset_], size_ + offset_);
     data_ = nullptr;
   }
 }
 
-bool MemoryFileAtOffset::Init(const std::string& file, uint64_t offset) {
+bool MemoryFileAtOffset::Init(const std::string& file, uint64_t offset, uint64_t size) {
+  // Clear out any previous data if it exists.
+  Clear();
+
   android::base::unique_fd fd(TEMP_FAILURE_RETRY(open(file.c_str(), O_RDONLY | O_CLOEXEC)));
   if (fd == -1) {
     return false;
@@ -70,7 +96,17 @@ bool MemoryFileAtOffset::Init(const std::string& file, uint64_t offset) {
 
   offset_ = offset & (getpagesize() - 1);
   uint64_t aligned_offset = offset & ~(getpagesize() - 1);
+  if (aligned_offset > static_cast<uint64_t>(buf.st_size) ||
+      offset > static_cast<uint64_t>(buf.st_size)) {
+    return false;
+  }
+
   size_ = buf.st_size - aligned_offset;
+  uint64_t max_size;
+  if (!__builtin_add_overflow(size, offset_, &max_size) && max_size < size_) {
+    // Truncate the mapped size.
+    size_ = max_size;
+  }
   void* map = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, aligned_offset);
   if (map == MAP_FAILED) {
     return false;
@@ -83,18 +119,25 @@ bool MemoryFileAtOffset::Init(const std::string& file, uint64_t offset) {
 }
 
 bool MemoryFileAtOffset::Read(uint64_t addr, void* dst, size_t size) {
-  if (addr + size > size_) {
+  uint64_t max_size;
+  if (__builtin_add_overflow(addr, size, &max_size) || max_size > size_) {
     return false;
   }
   memcpy(dst, &data_[addr], size);
   return true;
 }
 
-static bool PtraceRead(pid_t pid, uint64_t addr, long* value) {
+bool MemoryRemote::PtraceRead(uint64_t addr, long* value) {
+#if !defined(__LP64__)
+  // Cannot read an address greater than 32 bits.
+  if (addr > UINT32_MAX) {
+    return false;
+  }
+#endif
   // ptrace() returns -1 and sets errno when the operation fails.
   // To disambiguate -1 from a valid result, we clear errno beforehand.
   errno = 0;
-  *value = ptrace(PTRACE_PEEKTEXT, pid, reinterpret_cast<void*>(addr), nullptr);
+  *value = ptrace(PTRACE_PEEKTEXT, pid_, reinterpret_cast<void*>(addr), nullptr);
   if (*value == -1 && errno) {
     return false;
   }
@@ -102,11 +145,17 @@ static bool PtraceRead(pid_t pid, uint64_t addr, long* value) {
 }
 
 bool MemoryRemote::Read(uint64_t addr, void* dst, size_t bytes) {
+  // Make sure that there is no overflow.
+  uint64_t max_size;
+  if (__builtin_add_overflow(addr, bytes, &max_size)) {
+    return false;
+  }
+
   size_t bytes_read = 0;
   long data;
   size_t align_bytes = addr & (sizeof(long) - 1);
   if (align_bytes != 0) {
-    if (!PtraceRead(pid_, addr & ~(sizeof(long) - 1), &data)) {
+    if (!PtraceRead(addr & ~(sizeof(long) - 1), &data)) {
       return false;
     }
     size_t copy_bytes = std::min(sizeof(long) - align_bytes, bytes);
@@ -118,7 +167,7 @@ bool MemoryRemote::Read(uint64_t addr, void* dst, size_t bytes) {
   }
 
   for (size_t i = 0; i < bytes / sizeof(long); i++) {
-    if (!PtraceRead(pid_, addr, &data)) {
+    if (!PtraceRead(addr, &data)) {
       return false;
     }
     memcpy(dst, &data, sizeof(long));
@@ -129,7 +178,7 @@ bool MemoryRemote::Read(uint64_t addr, void* dst, size_t bytes) {
 
   size_t left_over = bytes & (sizeof(long) - 1);
   if (left_over) {
-    if (!PtraceRead(pid_, addr, &data)) {
+    if (!PtraceRead(addr, &data)) {
       return false;
     }
     memcpy(dst, &data, left_over);
@@ -139,7 +188,13 @@ bool MemoryRemote::Read(uint64_t addr, void* dst, size_t bytes) {
 }
 
 bool MemoryLocal::Read(uint64_t addr, void* dst, size_t size) {
-  // The process_vm_readv call does will not always work on remote
+  // Make sure that there is no overflow.
+  uint64_t max_size;
+  if (__builtin_add_overflow(addr, size, &max_size)) {
+    return false;
+  }
+
+  // The process_vm_readv call will not always work on remote
   // processes, so only use it for reads from the current pid.
   // Use this method to avoid crashes if an address is invalid since
   // unwind data could try to access any part of the address space.
@@ -172,9 +227,29 @@ bool MemoryOffline::Init(const std::string& file, uint64_t offset) {
 }
 
 bool MemoryOffline::Read(uint64_t addr, void* dst, size_t size) {
-  if (addr < start_ || addr + size > start_ + offset_ + size_) {
+  uint64_t max_size;
+  if (__builtin_add_overflow(addr, size, &max_size)) {
+    return false;
+  }
+
+  uint64_t real_size;
+  if (__builtin_add_overflow(start_, offset_, &real_size) ||
+      __builtin_add_overflow(real_size, size_, &real_size)) {
+    return false;
+  }
+
+  if (addr < start_ || max_size > real_size) {
     return false;
   }
   memcpy(dst, &data_[addr + offset_ - start_ + sizeof(start_)], size);
   return true;
+}
+
+bool MemoryRange::Read(uint64_t addr, void* dst, size_t size) {
+  uint64_t max_read;
+  if (__builtin_add_overflow(addr, size, &max_read) || max_read > length_) {
+    return false;
+  }
+  // The check above guarantees that addr + begin_ will not overflow.
+  return memory_->Read(addr + begin_, dst, size);
 }

@@ -32,7 +32,7 @@
 
 #if !ADB_HOST
 #include <android-base/properties.h>
-#include <private/android_logger.h>
+#include <log/log_properties.h>
 #endif
 
 #include "adb.h"
@@ -794,7 +794,7 @@ static int smart_socket_enqueue(asocket* s, apacket* p) {
     if (!s->transport) {
         SendFail(s->peer->fd, "device offline (no transport)");
         goto fail;
-    } else if (s->transport->connection_state == kCsOffline) {
+    } else if (s->transport->GetConnectionState() == kCsOffline) {
         /* if there's no remote we fail the connection
          ** right here and terminate it
          */

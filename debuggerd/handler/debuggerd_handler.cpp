@@ -48,8 +48,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "private/bionic_futex.h"
-#include "private/libc_logging.h"
+#include <async_safe/log.h>
 
 // see man(2) prctl, specifically the section about PR_GET_NAME
 #define MAX_TASK_NAME_LEN (16)
@@ -62,18 +61,36 @@
 
 #define CRASH_DUMP_PATH "/system/bin/" CRASH_DUMP_NAME
 
-extern "C" bool debuggerd_fallback(ucontext_t*, siginfo_t*, void*);
+static inline void futex_wait(volatile void* ftx, int value) {
+  syscall(__NR_futex, ftx, FUTEX_WAIT, value, nullptr, nullptr, 0);
+}
+
+class ErrnoRestorer {
+ public:
+  ErrnoRestorer() : saved_errno_(errno) {
+  }
+
+  ~ErrnoRestorer() {
+    errno = saved_errno_;
+  }
+
+ private:
+  int saved_errno_;
+};
+
+extern "C" void debuggerd_fallback_handler(siginfo_t*, ucontext_t*, void*);
 
 static debuggerd_callbacks_t g_callbacks;
 
 // Mutex to ensure only one crashing thread dumps itself.
 static pthread_mutex_t crash_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Don't use __libc_fatal because it exits via abort, which might put us back into a signal handler.
+// Don't use async_safe_fatal because it exits via abort, which might put us back into
+// a signal handler.
 static void __noreturn __printflike(1, 2) fatal(const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
-  __libc_format_log_va_list(ANDROID_LOG_FATAL, "libc", fmt, args);
+  async_safe_format_log_va_list(ANDROID_LOG_FATAL, "libc", fmt, args);
   _exit(1);
 }
 
@@ -83,7 +100,7 @@ static void __noreturn __printflike(1, 2) fatal_errno(const char* fmt, ...) {
   va_start(args, fmt);
 
   char buf[4096];
-  __libc_format_buffer_va_list(buf, sizeof(buf), fmt, args);
+  async_safe_format_buffer_va_list(buf, sizeof(buf), fmt, args);
   fatal("%s: %s", buf, strerror(err));
 }
 
@@ -107,8 +124,8 @@ static void log_signal_summary(int signum, const siginfo_t* info) {
   }
 
   if (signum == DEBUGGER_SIGNAL) {
-    __libc_format_log(ANDROID_LOG_FATAL, "libc", "Requested dump for tid %d (%s)", gettid(),
-                      thread_name);
+    async_safe_format_log(ANDROID_LOG_INFO, "libc", "Requested dump for tid %d (%s)", gettid(),
+                          thread_name);
     return;
   }
 
@@ -153,14 +170,14 @@ static void log_signal_summary(int signum, const siginfo_t* info) {
   char addr_desc[32];  // ", fault addr 0x1234"
   addr_desc[0] = code_desc[0] = 0;
   if (info != nullptr) {
-    __libc_format_buffer(code_desc, sizeof(code_desc), ", code %d", info->si_code);
+    async_safe_format_buffer(code_desc, sizeof(code_desc), ", code %d", info->si_code);
     if (has_address) {
-      __libc_format_buffer(addr_desc, sizeof(addr_desc), ", fault addr %p", info->si_addr);
+      async_safe_format_buffer(addr_desc, sizeof(addr_desc), ", fault addr %p", info->si_addr);
     }
   }
 
-  __libc_format_log(ANDROID_LOG_FATAL, "libc", "Fatal signal %d (%s)%s%s in tid %d (%s)", signum,
-                    signal_name, code_desc, addr_desc, gettid(), thread_name);
+  async_safe_format_log(ANDROID_LOG_FATAL, "libc", "Fatal signal %d (%s)%s%s in tid %d (%s)",
+                        signum, signal_name, code_desc, addr_desc, gettid(), thread_name);
 }
 
 /*
@@ -169,8 +186,8 @@ static void log_signal_summary(int signum, const siginfo_t* info) {
 static bool have_siginfo(int signum) {
   struct sigaction old_action;
   if (sigaction(signum, nullptr, &old_action) < 0) {
-    __libc_format_log(ANDROID_LOG_WARN, "libc", "Failed testing for SA_SIGINFO: %s",
-                      strerror(errno));
+    async_safe_format_log(ANDROID_LOG_WARN, "libc", "Failed testing for SA_SIGINFO: %s",
+                          strerror(errno));
     return false;
   }
   return (old_action.sa_flags & SA_SIGINFO) != 0;
@@ -194,7 +211,7 @@ static void raise_caps() {
     capdata[1].inheritable = capdata[1].permitted;
 
     if (capset(&capheader, &capdata[0]) == -1) {
-      __libc_format_log(ANDROID_LOG_ERROR, "libc", "capset failed: %s", strerror(errno));
+      async_safe_format_log(ANDROID_LOG_ERROR, "libc", "capset failed: %s", strerror(errno));
     }
   }
 
@@ -204,8 +221,8 @@ static void raise_caps() {
   for (unsigned long i = 0; i < 64; ++i) {
     if (capmask & (1ULL << i)) {
       if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, i, 0, 0) != 0) {
-        __libc_format_log(ANDROID_LOG_ERROR, "libc", "failed to raise ambient capability %lu: %s",
-                          i, strerror(errno));
+        async_safe_format_log(ANDROID_LOG_ERROR, "libc",
+                              "failed to raise ambient capability %lu: %s", i, strerror(errno));
       }
     }
   }
@@ -247,8 +264,8 @@ static int debuggerd_dispatch_pseudothread(void* arg) {
   // Don't use fork(2) to avoid calling pthread_atfork handlers.
   int forkpid = clone(nullptr, nullptr, 0, nullptr);
   if (forkpid == -1) {
-    __libc_format_log(ANDROID_LOG_FATAL, "libc", "failed to fork in debuggerd signal handler: %s",
-                      strerror(errno));
+    async_safe_format_log(ANDROID_LOG_FATAL, "libc",
+                          "failed to fork in debuggerd signal handler: %s", strerror(errno));
   } else if (forkpid == 0) {
     TEMP_FAILURE_RETRY(dup2(pipefds[1], STDOUT_FILENO));
     close(pipefds[0]);
@@ -258,8 +275,9 @@ static int debuggerd_dispatch_pseudothread(void* arg) {
 
     char main_tid[10];
     char pseudothread_tid[10];
-    __libc_format_buffer(main_tid, sizeof(main_tid), "%d", thread_info->crashing_tid);
-    __libc_format_buffer(pseudothread_tid, sizeof(pseudothread_tid), "%d", thread_info->pseudothread_tid);
+    async_safe_format_buffer(main_tid, sizeof(main_tid), "%d", thread_info->crashing_tid);
+    async_safe_format_buffer(pseudothread_tid, sizeof(pseudothread_tid), "%d",
+                             thread_info->pseudothread_tid);
 
     execl(CRASH_DUMP_PATH, CRASH_DUMP_NAME, main_tid, pseudothread_tid, nullptr);
 
@@ -269,15 +287,16 @@ static int debuggerd_dispatch_pseudothread(void* arg) {
     char buf[4];
     ssize_t rc = TEMP_FAILURE_RETRY(read(pipefds[0], &buf, sizeof(buf)));
     if (rc == -1) {
-      __libc_format_log(ANDROID_LOG_FATAL, "libc", "read of IPC pipe failed: %s", strerror(errno));
+      async_safe_format_log(ANDROID_LOG_FATAL, "libc", "read of IPC pipe failed: %s",
+                            strerror(errno));
     } else if (rc == 0) {
-      __libc_format_log(ANDROID_LOG_FATAL, "libc", "crash_dump helper failed to exec");
+      async_safe_format_log(ANDROID_LOG_FATAL, "libc", "crash_dump helper failed to exec");
     } else if (rc != 1) {
-      __libc_format_log(ANDROID_LOG_FATAL, "libc",
-                        "read of IPC pipe returned unexpected value: %zd", rc);
+      async_safe_format_log(ANDROID_LOG_FATAL, "libc",
+                            "read of IPC pipe returned unexpected value: %zd", rc);
     } else {
       if (buf[0] != '\1') {
-        __libc_format_log(ANDROID_LOG_FATAL, "libc", "crash_dump helper reported failure");
+        async_safe_format_log(ANDROID_LOG_FATAL, "libc", "crash_dump helper reported failure");
       } else {
         thread_info->crash_dump_started = true;
       }
@@ -287,10 +306,10 @@ static int debuggerd_dispatch_pseudothread(void* arg) {
     // Don't leave a zombie child.
     int status;
     if (TEMP_FAILURE_RETRY(waitpid(forkpid, &status, 0)) == -1) {
-      __libc_format_log(ANDROID_LOG_FATAL, "libc", "failed to wait for crash_dump helper: %s",
-                        strerror(errno));
+      async_safe_format_log(ANDROID_LOG_FATAL, "libc", "failed to wait for crash_dump helper: %s",
+                            strerror(errno));
     } else if (WIFSTOPPED(status) || WIFSIGNALED(status)) {
-      __libc_format_log(ANDROID_LOG_FATAL, "libc", "crash_dump helper crashed or stopped");
+      async_safe_format_log(ANDROID_LOG_FATAL, "libc", "crash_dump helper crashed or stopped");
       thread_info->crash_dump_started = false;
     }
   }
@@ -323,20 +342,14 @@ static void resend_signal(siginfo_t* info, bool crash_dump_started) {
       fatal_errno("failed to resend signal during crash");
     }
   }
-
-  if (info->si_signo == DEBUGGER_SIGNAL) {
-    pthread_mutex_unlock(&crash_mutex);
-  }
 }
 
 // Handler that does crash dumping by forking and doing the processing in the child.
 // Do this by ptracing the relevant thread, and then execing debuggerd to do the actual dump.
 static void debuggerd_signal_handler(int signal_number, siginfo_t* info, void* context) {
-  int ret = pthread_mutex_lock(&crash_mutex);
-  if (ret != 0) {
-    __libc_format_log(ANDROID_LOG_INFO, "libc", "pthread_mutex_lock failed: %s", strerror(ret));
-    return;
-  }
+  // Make sure we don't change the value of errno, in case a signal comes in between the process
+  // making a syscall and checking errno.
+  ErrnoRestorer restorer;
 
   // It's possible somebody cleared the SA_SIGINFO flag, which would mean
   // our "info" arg holds an undefined value.
@@ -359,26 +372,32 @@ static void debuggerd_signal_handler(int signal_number, siginfo_t* info, void* c
     // check to allow all si_code values in calls coming from inside the house.
   }
 
-  log_signal_summary(signal_number, info);
-
   void* abort_message = nullptr;
   if (g_callbacks.get_abort_message) {
     abort_message = g_callbacks.get_abort_message();
   }
 
   if (prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1) {
-    ucontext_t* ucontext = static_cast<ucontext_t*>(context);
-    if (signal_number == DEBUGGER_SIGNAL || !debuggerd_fallback(ucontext, info, abort_message)) {
-      // The process has NO_NEW_PRIVS enabled, so we can't transition to the crash_dump context.
-      __libc_format_log(ANDROID_LOG_INFO, "libc",
-                        "Suppressing debuggerd output because prctl(PR_GET_NO_NEW_PRIVS)==1");
-    }
+    // This check might be racy if another thread sets NO_NEW_PRIVS, but this should be unlikely,
+    // you can only set NO_NEW_PRIVS to 1, and the effect should be at worst a single missing
+    // ANR trace.
+    debuggerd_fallback_handler(info, static_cast<ucontext_t*>(context), abort_message);
     resend_signal(info, false);
     return;
   }
 
-  // Populate si_value with the abort message address, if found.
-  if (abort_message) {
+  // Only allow one thread to handle a signal at a time.
+  int ret = pthread_mutex_lock(&crash_mutex);
+  if (ret != 0) {
+    async_safe_format_log(ANDROID_LOG_INFO, "libc", "pthread_mutex_lock failed: %s", strerror(ret));
+    return;
+  }
+
+  log_signal_summary(signal_number, info);
+
+  // If this was a fatal crash, populate si_value with the abort message address if possible.
+  // Note that applications can set an abort message without aborting.
+  if (abort_message && signal_number != DEBUGGER_SIGNAL) {
     info->si_value.sival_ptr = abort_message;
   }
 
@@ -406,10 +425,10 @@ static void debuggerd_signal_handler(int signal_number, siginfo_t* info, void* c
   }
 
   // Wait for the child to start...
-  __futex_wait(&thread_info.pseudothread_tid, -1, nullptr);
+  futex_wait(&thread_info.pseudothread_tid, -1);
 
   // and then wait for it to finish.
-  __futex_wait(&thread_info.pseudothread_tid, child_pid, nullptr);
+  futex_wait(&thread_info.pseudothread_tid, child_pid);
 
   // Restore PR_SET_DUMPABLE to its original value.
   if (prctl(PR_SET_DUMPABLE, orig_dumpable) != 0) {
@@ -427,6 +446,11 @@ static void debuggerd_signal_handler(int signal_number, siginfo_t* info, void* c
   }
 
   resend_signal(info, thread_info.crash_dump_started);
+  if (info->si_signo == DEBUGGER_SIGNAL) {
+    // If the signal is fatal, don't unlock the mutex to prevent other crashing threads from
+    // starting to dump right before our death.
+    pthread_mutex_unlock(&crash_mutex);
+  }
 }
 
 void debuggerd_init(debuggerd_callbacks_t* callbacks) {

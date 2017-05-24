@@ -22,8 +22,11 @@
 
 #include <android-base/unique_fd.h>
 #include <cutils/sockets.h>
+#include <debuggerd/protocol.h>
 
-ssize_t send_fd(int sockfd, const void* data, size_t len, android::base::unique_fd fd) {
+using android::base::unique_fd;
+
+ssize_t send_fd(int sockfd, const void* data, size_t len, unique_fd fd) {
   char cmsg_buf[CMSG_SPACE(sizeof(int))];
 
   iovec iov = { .iov_base = const_cast<void*>(data), .iov_len = len };
@@ -39,8 +42,7 @@ ssize_t send_fd(int sockfd, const void* data, size_t len, android::base::unique_
   return TEMP_FAILURE_RETRY(sendmsg(sockfd, &msg, 0));
 }
 
-ssize_t recv_fd(int sockfd, void* _Nonnull data, size_t len,
-                android::base::unique_fd* _Nullable out_fd) {
+ssize_t recv_fd(int sockfd, void* _Nonnull data, size_t len, unique_fd* _Nullable out_fd) {
   char cmsg_buf[CMSG_SPACE(sizeof(int))];
 
   iovec iov = { .iov_base = const_cast<void*>(data), .iov_len = len };
@@ -61,7 +63,7 @@ ssize_t recv_fd(int sockfd, void* _Nonnull data, size_t len,
     return -1;
   }
 
-  android::base::unique_fd fd;
+  unique_fd fd;
   bool received_fd = msg.msg_controllen == sizeof(cmsg_buf);
   if (received_fd) {
     fd.reset(*reinterpret_cast<int*>(CMSG_DATA(cmsg)));
@@ -85,7 +87,7 @@ ssize_t recv_fd(int sockfd, void* _Nonnull data, size_t len,
   return result;
 }
 
-bool Pipe(android::base::unique_fd* read, android::base::unique_fd* write) {
+bool Pipe(unique_fd* read, unique_fd* write) {
   int pipefds[2];
   if (pipe(pipefds) != 0) {
     return false;

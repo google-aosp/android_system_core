@@ -19,16 +19,15 @@
 #include <ctype.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <unistd.h>
 
+#include <android-base/logging.h>
 #include <android-base/stringprintf.h>
 #include <android-base/unique_fd.h>
 #include <cutils/android_get_control_file.h>
 #include <cutils/sockets.h>
 
 #include "init.h"
-#include "log.h"
 #include "util.h"
 
 DescriptorInfo::DescriptorInfo(const std::string& name, const std::string& type, uid_t uid,
@@ -81,7 +80,7 @@ int SocketInfo::Create(const std::string& context) const {
   int flags = ((type() == "stream" ? SOCK_STREAM :
                 (type() == "dgram" ? SOCK_DGRAM :
                  SOCK_SEQPACKET)));
-  return create_socket(name().c_str(), flags, perm(), uid(), gid(), context.c_str());
+  return create_socket(name().c_str(), flags, perm(), uid(), gid(), context.c_str(), sehandle);
 }
 
 const std::string SocketInfo::key() const {

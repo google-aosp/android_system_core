@@ -21,7 +21,7 @@
 #if !defined(_WIN32)
 #include <pthread.h>
 #endif
-#include <stdint.h>  /* uint16_t, int32_t */
+#include <stdint.h> /* uint16_t, int32_t */
 #include <stdio.h>
 #include <sys/types.h>
 #include <time.h>
@@ -32,6 +32,7 @@
 #include <log/log_main.h>
 #include <log/log_radio.h>
 #include <log/log_read.h>
+#include <log/log_safetynet.h>
 #include <log/log_system.h>
 #include <log/log_time.h>
 #include <log/uio.h> /* helper to define iovec for portability */
@@ -95,9 +96,9 @@ int __android_log_btwrite(int32_t tag, char type, const void* payload,
 int __android_log_bswrite(int32_t tag, const char* payload);
 
 #define android_bWriteLog(tag, payload, len) \
-    __android_log_bwrite(tag, payload, len)
+  __android_log_bwrite(tag, payload, len)
 #define android_btWriteLog(tag, type, payload, len) \
-    __android_log_btwrite(tag, type, payload, len)
+  __android_log_btwrite(tag, type, payload, len)
 
 /*
  * Event log entry types.
@@ -105,45 +106,46 @@ int __android_log_bswrite(int32_t tag, const char* payload);
 #ifndef __AndroidEventLogType_defined
 #define __AndroidEventLogType_defined
 typedef enum {
-    /* Special markers for android_log_list_element type */
-    EVENT_TYPE_LIST_STOP = '\n', /* declare end of list  */
-    EVENT_TYPE_UNKNOWN   = '?',  /* protocol error       */
+  /* Special markers for android_log_list_element type */
+  EVENT_TYPE_LIST_STOP = '\n', /* declare end of list  */
+  EVENT_TYPE_UNKNOWN = '?',    /* protocol error       */
 
-    /* must match with declaration in java/android/android/util/EventLog.java */
-    EVENT_TYPE_INT       = 0,    /* int32_t */
-    EVENT_TYPE_LONG      = 1,    /* int64_t */
-    EVENT_TYPE_STRING    = 2,
-    EVENT_TYPE_LIST      = 3,
-    EVENT_TYPE_FLOAT     = 4,
+  /* must match with declaration in java/android/android/util/EventLog.java */
+  EVENT_TYPE_INT = 0,  /* int32_t */
+  EVENT_TYPE_LONG = 1, /* int64_t */
+  EVENT_TYPE_STRING = 2,
+  EVENT_TYPE_LIST = 3,
+  EVENT_TYPE_FLOAT = 4,
 } AndroidEventLogType;
 #endif
 #define sizeof_AndroidEventLogType sizeof(typeof_AndroidEventLogType)
 #define typeof_AndroidEventLogType unsigned char
 
 #ifndef LOG_EVENT_INT
-#define LOG_EVENT_INT(_tag, _value) {                                       \
-        int intBuf = _value;                                                \
-        (void) android_btWriteLog(_tag, EVENT_TYPE_INT, &intBuf,            \
-            sizeof(intBuf));                                                \
-    }
+#define LOG_EVENT_INT(_tag, _value)                                          \
+  {                                                                          \
+    int intBuf = _value;                                                     \
+    (void)android_btWriteLog(_tag, EVENT_TYPE_INT, &intBuf, sizeof(intBuf)); \
+  }
 #endif
 #ifndef LOG_EVENT_LONG
-#define LOG_EVENT_LONG(_tag, _value) {                                      \
-        long long longBuf = _value;                                         \
-        (void) android_btWriteLog(_tag, EVENT_TYPE_LONG, &longBuf,          \
-            sizeof(longBuf));                                               \
-    }
+#define LOG_EVENT_LONG(_tag, _value)                                            \
+  {                                                                             \
+    long long longBuf = _value;                                                 \
+    (void)android_btWriteLog(_tag, EVENT_TYPE_LONG, &longBuf, sizeof(longBuf)); \
+  }
 #endif
 #ifndef LOG_EVENT_FLOAT
-#define LOG_EVENT_FLOAT(_tag, _value) {                                     \
-        float floatBuf = _value;                                            \
-        (void) android_btWriteLog(_tag, EVENT_TYPE_FLOAT, &floatBuf,        \
-            sizeof(floatBuf));                                              \
-    }
+#define LOG_EVENT_FLOAT(_tag, _value)                           \
+  {                                                             \
+    float floatBuf = _value;                                    \
+    (void)android_btWriteLog(_tag, EVENT_TYPE_FLOAT, &floatBuf, \
+                             sizeof(floatBuf));                 \
+  }
 #endif
 #ifndef LOG_EVENT_STRING
-#define LOG_EVENT_STRING(_tag, _value)                                      \
-        (void) __android_log_bswrite(_tag, _value);
+#define LOG_EVENT_STRING(_tag, _value) \
+  (void)__android_log_bswrite(_tag, _value);
 #endif
 
 #ifdef __linux__
@@ -163,31 +165,6 @@ clockid_t android_log_clockid();
 #endif
 
 #endif /* __linux__ */
-
-/* --------------------------------------------------------------------- */
-
-#ifndef _ANDROID_USE_LIBLOG_SAFETYNET_INTERFACE
-#ifndef __ANDROID_API__
-#define __ANDROID_USE_LIBLOG_SAFETYNET_INTERFACE 1
-#elif __ANDROID_API__ > 22 /* > Lollipop */
-#define __ANDROID_USE_LIBLOG_SAFETYNET_INTERFACE 1
-#else
-#define __ANDROID_USE_LIBLOG_SAFETYNET_INTERFACE 0
-#endif
-#endif
-
-#if __ANDROID_USE_LIBLOG_SAFETYNET_INTERFACE
-
-#define android_errorWriteLog(tag, subTag) \
-    __android_log_error_write(tag, subTag, -1, NULL, 0)
-
-#define android_errorWriteWithInfoLog(tag, subTag, uid, data, dataLen) \
-    __android_log_error_write(tag, subTag, uid, data, dataLen)
-
-int __android_log_error_write(int tag, const char* subTag, int32_t uid,
-                              const char* data, uint32_t dataLen);
-
-#endif /* __ANDROID_USE_LIBLOG_SAFETYNET_INTERFACE */
 
 /* --------------------------------------------------------------------- */
 
@@ -246,10 +223,9 @@ int __android_log_ratelimit(time_t seconds, time_t* last);
  *   }
  */
 
-#define IF_ALOG_RATELIMIT() \
-      if (__android_log_ratelimit(0, NULL) > 0)
+#define IF_ALOG_RATELIMIT() if (__android_log_ratelimit(0, NULL) > 0)
 #define IF_ALOG_RATELIMIT_LOCAL(seconds, state) \
-      if (__android_log_ratelimit(seconds, state) > 0)
+  if (__android_log_ratelimit(seconds, state) > 0)
 
 #else
 

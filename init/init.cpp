@@ -14,11 +14,14 @@
  * limitations under the License.
  */
 
+#include "init.h"
+
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <keyutils.h>
 #include <libgen.h>
 #include <paths.h>
 #include <signal.h>
@@ -40,38 +43,38 @@
 #include <selinux/label.h>
 #include <selinux/android.h>
 
+#include <android-base/chrono_utils.h>
 #include <android-base/file.h>
+#include <android-base/logging.h>
+#include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
-#include <cutils/fs.h>
-#include <cutils/iosched_policy.h>
-#include <cutils/list.h>
-#include <cutils/sockets.h>
 #include <libavb/libavb.h>
 #include <private/android_filesystem_config.h>
 
 #include <fstream>
 #include <memory>
-#include <set>
 #include <vector>
 
 #include "action.h"
 #include "bootchart.h"
 #include "devices.h"
-#include "fs_mgr.h"
 #include "import_parser.h"
-#include "init.h"
+#include "init_first_stage.h"
 #include "init_parser.h"
 #include "keychords.h"
 #include "log.h"
 #include "property_service.h"
+#include "reboot.h"
 #include "service.h"
 #include "signal_handler.h"
 #include "ueventd.h"
 #include "util.h"
 #include "watchdogd.h"
 
+using android::base::boot_clock;
+using android::base::GetProperty;
 using android::base::StringPrintf;
 
 struct selabel_handle *sehandle;
@@ -86,13 +89,16 @@ static time_t process_needs_restart_at;
 
 const char *ENV[32];
 
-static std::unique_ptr<Timer> waiting_for_exec(nullptr);
-
 static int epoll_fd = -1;
 
 static std::unique_ptr<Timer> waiting_for_prop(nullptr);
 static std::string wait_prop_name;
 static std::string wait_prop_value;
+
+void DumpState() {
+    ServiceManager::GetInstance().DumpState();
+    ActionManager::GetInstance().DumpState();
+}
 
 void register_epoll_handler(int fd, void (*fn)()) {
     epoll_event ev;
@@ -135,29 +141,12 @@ int add_environment(const char *key, const char *val)
     return -1;
 }
 
-bool start_waiting_for_exec()
-{
-    if (waiting_for_exec) {
-        return false;
-    }
-    waiting_for_exec.reset(new Timer());
-    return true;
-}
-
-void stop_waiting_for_exec()
-{
-    if (waiting_for_exec) {
-        LOG(INFO) << "Wait for exec took " << *waiting_for_exec;
-        waiting_for_exec.reset();
-    }
-}
-
 bool start_waiting_for_property(const char *name, const char *value)
 {
     if (waiting_for_prop) {
         return false;
     }
-    if (property_get(name) != value) {
+    if (GetProperty(name, "") != value) {
         // Current property value is not equal to expected value
         wait_prop_name = name;
         wait_prop_value = value;
@@ -169,10 +158,15 @@ bool start_waiting_for_property(const char *name, const char *value)
     return true;
 }
 
-void property_changed(const char *name, const char *value)
-{
-    if (property_triggers_enabled)
-        ActionManager::GetInstance().QueuePropertyTrigger(name, value);
+void property_changed(const std::string& name, const std::string& value) {
+    // If the property is sys.powerctl, we bypass the event queue and immediately handle it.
+    // This is to ensure that init will always and immediately shutdown/reboot, regardless of
+    // if there are other pending events to process or if init is waiting on an exec service or
+    // waiting on a property.
+    if (name == "sys.powerctl") HandlePowerctlMessage(value);
+
+    if (property_triggers_enabled) ActionManager::GetInstance().QueuePropertyChange(name, value);
+
     if (waiting_for_prop) {
         if (wait_prop_name == name && wait_prop_value == value) {
             wait_prop_name.clear();
@@ -445,7 +439,7 @@ static int keychord_init_action(const std::vector<std::string>& args)
 
 static int console_init_action(const std::vector<std::string>& args)
 {
-    std::string console = property_get("ro.boot.console");
+    std::string console = GetProperty("ro.boot.console", "");
     if (!console.empty()) {
         default_console = "/dev/" + console;
     }
@@ -469,11 +463,11 @@ static void import_kernel_nv(const std::string& key, const std::string& value, b
 }
 
 static void export_oem_lock_status() {
-    if (property_get("ro.oem_unlock_supported") != "1") {
+    if (!android::base::GetBoolProperty("ro.oem_unlock_supported", false)) {
         return;
     }
 
-    std::string value = property_get("ro.boot.verifiedbootstate");
+    std::string value = GetProperty("ro.boot.verifiedbootstate", "");
 
     if (!value.empty()) {
         property_set("ro.boot.flash.locked", value == "orange" ? "0" : "1");
@@ -494,47 +488,17 @@ static void export_kernel_boot_props() {
         { "ro.boot.revision",   "ro.revision",   "0", },
     };
     for (size_t i = 0; i < arraysize(prop_map); i++) {
-        std::string value = property_get(prop_map[i].src_prop);
+        std::string value = GetProperty(prop_map[i].src_prop, "");
         property_set(prop_map[i].dst_prop, (!value.empty()) ? value.c_str() : prop_map[i].default_value);
     }
 }
 
-static constexpr char android_dt_dir[] = "/proc/device-tree/firmware/android";
-
-static bool is_dt_compatible() {
-    std::string dt_value;
-    std::string file_name = StringPrintf("%s/compatible", android_dt_dir);
-
-    if (android::base::ReadFileToString(file_name, &dt_value)) {
-        // trim the trailing '\0' out, otherwise the comparison
-        // will produce false-negatives.
-        dt_value.resize(dt_value.size() - 1);
-        if (dt_value == "android,firmware") {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static bool is_dt_fstab_compatible() {
-    std::string dt_value;
-    std::string file_name = StringPrintf("%s/%s/compatible", android_dt_dir, "fstab");
-
-    if (android::base::ReadFileToString(file_name, &dt_value)) {
-        dt_value.resize(dt_value.size() - 1);
-        if (dt_value == "android,fstab") {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 static void process_kernel_dt() {
-    if (!is_dt_compatible()) return;
+    if (!is_android_dt_value_expected("compatible", "android,firmware")) {
+        return;
+    }
 
-    std::unique_ptr<DIR, int(*)(DIR*)>dir(opendir(android_dt_dir), closedir);
+    std::unique_ptr<DIR, int (*)(DIR*)> dir(opendir(kAndroidDtDir.c_str()), closedir);
     if (!dir) return;
 
     std::string dt_file;
@@ -544,7 +508,7 @@ static void process_kernel_dt() {
             continue;
         }
 
-        std::string file_name = StringPrintf("%s/%s", android_dt_dir, dp->d_name);
+        std::string file_name = kAndroidDtDir + dp->d_name;
 
         android::base::ReadFileToString(file_name, &dt_file);
         std::replace(dt_file.begin(), dt_file.end(), ',', '.');
@@ -572,7 +536,7 @@ static int property_enable_triggers_action(const std::vector<std::string>& args)
 static int queue_property_triggers_action(const std::vector<std::string>& args)
 {
     ActionManager::GetInstance().QueueBuiltinAction(property_enable_triggers_action, "enable_property_trigger");
-    ActionManager::GetInstance().QueueAllPropertyTriggers();
+    ActionManager::GetInstance().QueueAllPropertyActions();
     return 0;
 }
 
@@ -715,6 +679,48 @@ static bool fork_execve_and_wait_for_completion(const char* filename, char* cons
     }
 }
 
+static bool read_first_line(const char* file, std::string* line) {
+    line->clear();
+
+    std::string contents;
+    if (!android::base::ReadFileToString(file, &contents, true /* follow symlinks */)) {
+        return false;
+    }
+    std::istringstream in(contents);
+    std::getline(in, *line);
+    return true;
+}
+
+static bool selinux_find_precompiled_split_policy(std::string* file) {
+    file->clear();
+
+    static constexpr const char precompiled_sepolicy[] = "/vendor/etc/selinux/precompiled_sepolicy";
+    if (access(precompiled_sepolicy, R_OK) == -1) {
+        return false;
+    }
+    std::string actual_plat_id;
+    if (!read_first_line("/system/etc/selinux/plat_and_mapping_sepolicy.cil.sha256",
+                         &actual_plat_id)) {
+        PLOG(INFO) << "Failed to read "
+                      "/system/etc/selinux/plat_and_mapping_sepolicy.cil.sha256";
+        return false;
+    }
+    std::string precompiled_plat_id;
+    if (!read_first_line("/vendor/etc/selinux/precompiled_sepolicy.plat_and_mapping.sha256",
+                         &precompiled_plat_id)) {
+        PLOG(INFO) << "Failed to read "
+                      "/vendor/etc/selinux/"
+                      "precompiled_sepolicy.plat_and_mapping.sha256";
+        return false;
+    }
+    if ((actual_plat_id.empty()) || (actual_plat_id != precompiled_plat_id)) {
+        return false;
+    }
+
+    *file = precompiled_sepolicy;
+    return true;
+}
+
 static constexpr const char plat_policy_cil_file[] = "/system/etc/selinux/plat_sepolicy.cil";
 
 static bool selinux_is_split_policy_device() { return access(plat_policy_cil_file, R_OK) != -1; }
@@ -734,7 +740,31 @@ static bool selinux_load_split_policy() {
     // secilc is invoked to compile the above three policy files into a single monolithic policy
     // file. This file is then loaded into the kernel.
 
+    // Load precompiled policy from vendor image, if a matching policy is found there. The policy
+    // must match the platform policy on the system image.
+    std::string precompiled_sepolicy_file;
+    if (selinux_find_precompiled_split_policy(&precompiled_sepolicy_file)) {
+        android::base::unique_fd fd(
+            open(precompiled_sepolicy_file.c_str(), O_RDONLY | O_CLOEXEC | O_BINARY));
+        if (fd != -1) {
+            if (selinux_android_load_policy_from_fd(fd, precompiled_sepolicy_file.c_str()) < 0) {
+                LOG(ERROR) << "Failed to load SELinux policy from " << precompiled_sepolicy_file;
+                return false;
+            }
+            return true;
+        }
+    }
+    // No suitable precompiled policy could be loaded
+
     LOG(INFO) << "Compiling SELinux policy";
+
+    // Determine the highest policy language version supported by the kernel
+    set_selinuxmnt("/sys/fs/selinux");
+    int max_policy_version = security_policyvers();
+    if (max_policy_version == -1) {
+        PLOG(ERROR) << "Failed to determine highest policy version supported by kernel";
+        return false;
+    }
 
     // We store the output of the compilation on /dev because this is the most convenient tmpfs
     // storage mount available this early in the boot sequence.
@@ -745,14 +775,20 @@ static bool selinux_load_split_policy() {
         return false;
     }
 
-    const char* compile_args[] = {"/system/bin/secilc", plat_policy_cil_file, "-M", "true", "-c",
-                                  "30",  // TODO: pass in SELinux policy version from build system
-                                  "/vendor/etc/selinux/mapping_sepolicy.cil",
-                                  "/vendor/etc/selinux/nonplat_sepolicy.cil", "-o",
-                                  compiled_sepolicy,
-                                  // We don't care about file_contexts output by the compiler
-                                  "-f", "/sys/fs/selinux/null",  // /dev/null is not yet available
-                                  nullptr};
+    // clang-format off
+    const char* compile_args[] = {
+        "/system/bin/secilc",
+        plat_policy_cil_file,
+        "-M", "true",
+        // Target the highest policy language version supported by the kernel
+        "-c", std::to_string(max_policy_version).c_str(),
+        "/system/etc/selinux/mapping_sepolicy.cil",
+        "/vendor/etc/selinux/nonplat_sepolicy.cil",
+        "-o", compiled_sepolicy,
+        // We don't care about file_contexts output by the compiler
+        "-f", "/sys/fs/selinux/null",  // /dev/null is not yet available
+        nullptr};
+    // clang-format on
 
     if (!fork_execve_and_wait_for_completion(compile_args[0], (char**)compile_args, (char**)ENV)) {
         unlink(compiled_sepolicy);
@@ -828,6 +864,30 @@ static void selinux_initialize(bool in_kernel_domain) {
     }
 }
 
+// The files and directories that were created before initial sepolicy load or
+// files on ramdisk need to have their security context restored to the proper
+// value. This must happen before /dev is populated by ueventd.
+static void selinux_restore_context() {
+    LOG(INFO) << "Running restorecon...";
+    restorecon("/dev");
+    restorecon("/dev/kmsg");
+    if constexpr (WORLD_WRITABLE_KMSG) {
+      restorecon("/dev/kmsg_debug");
+    }
+    restorecon("/dev/socket");
+    restorecon("/dev/random");
+    restorecon("/dev/urandom");
+    restorecon("/dev/__properties__");
+    restorecon("/plat_property_contexts");
+    restorecon("/nonplat_property_contexts");
+    restorecon("/sys", SELINUX_ANDROID_RESTORECON_RECURSE);
+    restorecon("/dev/block", SELINUX_ANDROID_RESTORECON_RECURSE);
+    restorecon("/dev/device-mapper");
+
+    restorecon("/sbin/mke2fs");
+    restorecon("/sbin/e2fsdroid");
+}
+
 // Set the UDC controller for the ConfigFS USB Gadgets.
 // Read the UDC controller in use from "/sys/class/udc".
 // In case of multiple UDC controllers select the first one.
@@ -844,191 +904,29 @@ static void set_usb_controller() {
     }
 }
 
-static bool early_mount_one(struct fstab_rec* rec) {
-    if (rec && fs_mgr_is_verified(rec)) {
-        // setup verity and create the dm-XX block device
-        // needed to mount this partition
-        int ret = fs_mgr_setup_verity(rec, false);
-        if (ret == FS_MGR_SETUP_VERITY_FAIL) {
-            PLOG(ERROR) << "early_mount: Failed to setup verity for '" << rec->mount_point << "'";
-            return false;
-        }
-
-        // The exact block device name is added as a mount source by
-        // fs_mgr_setup_verity() in ->blk_device as "/dev/block/dm-XX"
-        // We create that device by running coldboot on /sys/block/dm-XX
-        std::string dm_device(basename(rec->blk_device));
-        std::string syspath = StringPrintf("/sys/block/%s", dm_device.c_str());
-        device_init(syspath.c_str(), [&](uevent* uevent) -> coldboot_action_t {
-            if (uevent->device_name && !strcmp(dm_device.c_str(), uevent->device_name)) {
-                LOG(VERBOSE) << "early_mount: creating dm-verity device : " << dm_device;
-                return COLDBOOT_STOP;
-            }
-            return COLDBOOT_CONTINUE;
-        });
-    }
-
-    if (rec && fs_mgr_do_mount_one(rec)) {
-        PLOG(ERROR) << "early_mount: Failed to mount '" << rec->mount_point << "'";
-        return false;
-    }
-
-    return true;
-}
-
-// Creates devices with uevent->partition_name matching one in the in/out
-// partition_names. Note that the partition_names MUST have A/B suffix
-// when A/B is used. Found partitions will then be removed from the
-// partition_names for caller to check which devices are NOT created.
-static void early_device_init(std::set<std::string>* partition_names) {
-    if (partition_names->empty()) {
-        return;
-    }
-    device_init(nullptr, [=](uevent* uevent) -> coldboot_action_t {
-        if (!strncmp(uevent->subsystem, "firmware", 8)) {
-            return COLDBOOT_CONTINUE;
-        }
-
-        // we need platform devices to create symlinks
-        if (!strncmp(uevent->subsystem, "platform", 8)) {
-            return COLDBOOT_CREATE;
-        }
-
-        // Ignore everything that is not a block device
-        if (strncmp(uevent->subsystem, "block", 5)) {
-            return COLDBOOT_CONTINUE;
-        }
-
-        if (uevent->partition_name) {
-            // match partition names to create device nodes for partitions
-            // both partition_names and uevent->partition_name have A/B suffix when A/B is used
-            auto iter = partition_names->find(uevent->partition_name);
-            if (iter != partition_names->end()) {
-                LOG(VERBOSE) << "early_mount: found partition: " << *iter;
-                partition_names->erase(iter);
-                if (partition_names->empty()) {
-                    return COLDBOOT_STOP;  // found all partitions, stop coldboot
-                } else {
-                    return COLDBOOT_CREATE;  // create this device and continue to find others
-                }
-            }
-        }
-        // Not found a partition or find an unneeded partition, continue to find others
-        return COLDBOOT_CONTINUE;
-    });
-}
-
-static bool get_early_partitions(const std::vector<fstab_rec*>& early_fstab_recs,
-                                 std::set<std::string>* out_partitions, bool* out_need_verity) {
-    std::string meta_partition;
-    out_partitions->clear();
-    *out_need_verity = false;
-
-    for (auto fstab_rec : early_fstab_recs) {
-        // don't allow verifyatboot for early mounted partitions
-        if (fs_mgr_is_verifyatboot(fstab_rec)) {
-            LOG(ERROR) << "early_mount: partitions can't be verified at boot";
-            return false;
-        }
-        // check for verified partitions
-        if (fs_mgr_is_verified(fstab_rec)) {
-            *out_need_verity = true;
-        }
-        // check if verity metadata is on a separate partition and get partition
-        // name from the end of the ->verity_loc path. verity state is not partition
-        // specific, so there must be only 1 additional partition that carries
-        // verity state.
-        if (fstab_rec->verity_loc) {
-            if (!meta_partition.empty()) {
-                LOG(ERROR) << "early_mount: more than one meta partition found: " << meta_partition
-                           << ", " << basename(fstab_rec->verity_loc);
-                return false;
-            } else {
-                meta_partition = basename(fstab_rec->verity_loc);
-            }
-        }
-    }
-
-    // includes those early mount partitions and meta_partition (if any)
-    // note that fstab_rec->blk_device has A/B suffix updated by fs_mgr when A/B is used
-    for (auto fstab_rec : early_fstab_recs) {
-        out_partitions->emplace(basename(fstab_rec->blk_device));
-    }
-
-    if (!meta_partition.empty()) {
-        out_partitions->emplace(std::move(meta_partition));
-    }
-
-    return true;
-}
-
-/* Early mount vendor and ODM partitions. The fstab is read from device-tree. */
-static bool early_mount() {
-    // skip early mount if we're in recovery mode
-    if (access("/sbin/recovery", F_OK) == 0) {
-        LOG(INFO) << "Early mount skipped (recovery mode)";
-        return true;
-    }
-
-    // first check if device tree fstab entries are compatible
-    if (!is_dt_fstab_compatible()) {
-        LOG(INFO) << "Early mount skipped (missing/incompatible fstab in device tree)";
-        return true;
-    }
-
-    std::unique_ptr<fstab, decltype(&fs_mgr_free_fstab)> tab(
-        fs_mgr_read_fstab_dt(), fs_mgr_free_fstab);
-    if (!tab) {
-        LOG(ERROR) << "Early mount failed to read fstab from device tree";
-        return false;
-    }
-
-    // find out fstab records for odm, system and vendor
-    std::vector<fstab_rec*> early_fstab_recs;
-    for (auto mount_point : {"/odm", "/system", "/vendor"}) {
-        fstab_rec* fstab_rec = fs_mgr_get_entry_for_mount_point(tab.get(), mount_point);
-        if (fstab_rec != nullptr) {
-            early_fstab_recs.push_back(fstab_rec);
-        }
-    }
-
-    // nothing to early mount
-    if (early_fstab_recs.empty()) return true;
-
-    bool need_verity;
-    std::set<std::string> partition_names;
-    // partition_names MUST have A/B suffix when A/B is used
-    if (!get_early_partitions(early_fstab_recs, &partition_names, &need_verity)) {
-        return false;
-    }
-
-    bool success = false;
-    // create the devices we need..
-    early_device_init(&partition_names);
-
-    // early_device_init will remove found partitions from partition_names
-    // So if the partition_names is not empty here, means some partitions
-    // are not found
-    if (!partition_names.empty()) {
-        LOG(ERROR) << "early_mount: partition(s) not found: "
-                   << android::base::Join(partition_names, ", ");
-        goto done;
-    }
-
-    if (need_verity) {
-        // create /dev/device mapper
-        device_init("/sys/devices/virtual/misc/device-mapper",
-                    [&](uevent* uevent) -> coldboot_action_t { return COLDBOOT_STOP; });
-    }
-
-    for (auto fstab_rec : early_fstab_recs) {
-        if (!early_mount_one(fstab_rec)) goto done;
-    }
-    success = true;
-
-done:
-    device_close();
-    return success;
+static void install_reboot_signal_handlers() {
+    // Instead of panic'ing the kernel as is the default behavior when init crashes,
+    // we prefer to reboot to bootloader on development builds, as this will prevent
+    // boot looping bad configurations and allow both developers and test farms to easily
+    // recover.
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    sigfillset(&action.sa_mask);
+    action.sa_handler = [](int) {
+        // panic() reboots to bootloader
+        panic();
+    };
+    action.sa_flags = SA_RESTART;
+    sigaction(SIGABRT, &action, nullptr);
+    sigaction(SIGBUS, &action, nullptr);
+    sigaction(SIGFPE, &action, nullptr);
+    sigaction(SIGILL, &action, nullptr);
+    sigaction(SIGSEGV, &action, nullptr);
+#if defined(SIGSTKFLT)
+    sigaction(SIGSTKFLT, &action, nullptr);
+#endif
+    sigaction(SIGSYS, &action, nullptr);
+    sigaction(SIGTRAP, &action, nullptr);
 }
 
 static int charging_mode_booting(void) {
@@ -1058,47 +956,56 @@ int main(int argc, char** argv) {
         return watchdogd_main(argc, argv);
     }
 
-    boot_clock::time_point start_time = boot_clock::now();
-
-    // Clear the umask.
-    umask(0);
+    if (REBOOT_BOOTLOADER_ON_PANIC) {
+        install_reboot_signal_handlers();
+    }
 
     add_environment("PATH", _PATH_DEFPATH);
 
     bool is_first_stage = (getenv("INIT_SECOND_STAGE") == nullptr);
 
-    // Don't expose the raw commandline to unprivileged processes.
-    chmod("/proc/cmdline", 0440);
-
-    // Get the basic filesystem setup we need put together in the initramdisk
-    // on / and then we'll let the rc file figure out the rest.
     if (is_first_stage) {
+        boot_clock::time_point start_time = boot_clock::now();
+
+        // Clear the umask.
+        umask(0);
+
+        // Get the basic filesystem setup we need put together in the initramdisk
+        // on / and then we'll let the rc file figure out the rest.
         mount("tmpfs", "/dev", "tmpfs", MS_NOSUID, "mode=0755");
         mkdir("/dev/pts", 0755);
         mkdir("/dev/socket", 0755);
         mount("devpts", "/dev/pts", "devpts", 0, NULL);
         #define MAKE_STR(x) __STRING(x)
         mount("proc", "/proc", "proc", 0, "hidepid=2,gid=" MAKE_STR(AID_READPROC));
+        // Don't expose the raw commandline to unprivileged processes.
+        chmod("/proc/cmdline", 0440);
         gid_t groups[] = { AID_READPROC };
         setgroups(arraysize(groups), groups);
         mount("sysfs", "/sys", "sysfs", 0, NULL);
         mount("selinuxfs", "/sys/fs/selinux", "selinuxfs", 0, NULL);
+
         mknod("/dev/kmsg", S_IFCHR | 0600, makedev(1, 11));
+
+        if constexpr (WORLD_WRITABLE_KMSG) {
+          mknod("/dev/kmsg_debug", S_IFCHR | 0622, makedev(1, 11));
+        }
+
         mknod("/dev/random", S_IFCHR | 0666, makedev(1, 8));
         mknod("/dev/urandom", S_IFCHR | 0666, makedev(1, 9));
-    }
 
-    // Now that tmpfs is mounted on /dev and we have /dev/kmsg, we can actually
-    // talk to the outside world...
-    InitKernelLogging(argv);
+        // Now that tmpfs is mounted on /dev and we have /dev/kmsg, we can actually
+        // talk to the outside world...
+        InitKernelLogging(argv);
 
-    LOG(INFO) << "init " << (is_first_stage ? "first" : "second") << " stage started!";
+        LOG(INFO) << "init first stage started!";
 
-    if (is_first_stage) {
-        if (!early_mount()) {
+        if (!DoFirstStageMount()) {
             LOG(ERROR) << "Failed to mount required partitions early ...";
             panic();
         }
+
+        SetInitAvbVersionInRecovery();
 
         // Set up SELinux, loading the SELinux policy.
         selinux_initialize(true);
@@ -1118,56 +1025,54 @@ int main(int argc, char** argv) {
 
         char* path = argv[0];
         char* args[] = { path, nullptr };
-        if (execv(path, args) == -1) {
-            PLOG(ERROR) << "execv(\"" << path << "\") failed";
-            security_failure();
-        }
-    } else {
-        // Indicate that booting is in progress to background fw loaders, etc.
-        close(open("/dev/.booting", O_WRONLY | O_CREAT | O_CLOEXEC, 0000));
+        execv(path, args);
 
-        property_init();
-
-        // If arguments are passed both on the command line and in DT,
-        // properties set in DT always have priority over the command-line ones.
-        process_kernel_dt();
-        process_kernel_cmdline();
-
-        // Propagate the kernel variables to internal variables
-        // used by init as well as the current required properties.
-        export_kernel_boot_props();
-
-        // Make the time that init started available for bootstat to log.
-        property_set("ro.boottime.init", getenv("INIT_STARTED_AT"));
-        property_set("ro.boottime.init.selinux", getenv("INIT_SELINUX_TOOK"));
-
-        // Set libavb version for Framework-only OTA match in Treble build.
-        property_set("ro.boot.init.avb_version", std::to_string(AVB_MAJOR_VERSION).c_str());
-
-        // Clean up our environment.
-        unsetenv("INIT_SECOND_STAGE");
-        unsetenv("INIT_STARTED_AT");
-        unsetenv("INIT_SELINUX_TOOK");
-
-        // Now set up SELinux for second stage.
-        selinux_initialize(false);
+        // execv() only returns if an error happened, in which case we
+        // panic and never fall through this conditional.
+        PLOG(ERROR) << "execv(\"" << path << "\") failed";
+        security_failure();
     }
 
-    // These directories were necessarily created before initial policy load
-    // and therefore need their security context restored to the proper value.
-    // This must happen before /dev is populated by ueventd.
-    LOG(INFO) << "Running restorecon...";
-    restorecon("/dev");
-    restorecon("/dev/kmsg");
-    restorecon("/dev/socket");
-    restorecon("/dev/random");
-    restorecon("/dev/urandom");
-    restorecon("/dev/__properties__");
-    restorecon("/plat_property_contexts");
-    restorecon("/nonplat_property_contexts");
-    restorecon("/sys", SELINUX_ANDROID_RESTORECON_RECURSE);
-    restorecon("/dev/block", SELINUX_ANDROID_RESTORECON_RECURSE);
-    restorecon("/dev/device-mapper");
+    // At this point we're in the second stage of init.
+    InitKernelLogging(argv);
+    LOG(INFO) << "init second stage started!";
+
+    // Set up a session keyring that all processes will have access to. It
+    // will hold things like FBE encryption keys. No process should override
+    // its session keyring.
+    keyctl(KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING, 1);
+
+    // Indicate that booting is in progress to background fw loaders, etc.
+    close(open("/dev/.booting", O_WRONLY | O_CREAT | O_CLOEXEC, 0000));
+
+    property_init();
+
+    // If arguments are passed both on the command line and in DT,
+    // properties set in DT always have priority over the command-line ones.
+    process_kernel_dt();
+    process_kernel_cmdline();
+
+    // Propagate the kernel variables to internal variables
+    // used by init as well as the current required properties.
+    export_kernel_boot_props();
+
+    // Make the time that init started available for bootstat to log.
+    property_set("ro.boottime.init", getenv("INIT_STARTED_AT"));
+    property_set("ro.boottime.init.selinux", getenv("INIT_SELINUX_TOOK"));
+
+    // Set libavb version for Framework-only OTA match in Treble build.
+    const char* avb_version = getenv("INIT_AVB_VERSION");
+    if (avb_version) property_set("ro.boot.avb_version", avb_version);
+
+    // Clean up our environment.
+    unsetenv("INIT_SECOND_STAGE");
+    unsetenv("INIT_STARTED_AT");
+    unsetenv("INIT_SELINUX_TOOK");
+    unsetenv("INIT_AVB_VERSION");
+
+    // Now set up SELinux for second stage.
+    selinux_initialize(false);
+    selinux_restore_context();
 
     epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (epoll_fd == -1) {
@@ -1185,11 +1090,14 @@ int main(int argc, char** argv) {
     const BuiltinFunctionMap function_map;
     Action::set_function_map(&function_map);
 
+    ActionManager& am = ActionManager::GetInstance();
+    ServiceManager& sm = ServiceManager::GetInstance();
     Parser& parser = Parser::GetInstance();
-    parser.AddSectionParser("service",std::make_unique<ServiceParser>());
-    parser.AddSectionParser("on", std::make_unique<ActionParser>());
-    parser.AddSectionParser("import", std::make_unique<ImportParser>());
-    std::string bootscript = property_get("ro.boot.init_rc");
+
+    parser.AddSectionParser("service", std::make_unique<ServiceParser>(&sm));
+    parser.AddSectionParser("on", std::make_unique<ActionParser>(&am));
+    parser.AddSectionParser("import", std::make_unique<ImportParser>(&parser));
+    std::string bootscript = GetProperty("ro.boot.init_rc", "");
     if (bootscript.empty()) {
         parser.ParseConfig("/init.rc");
         parser.set_is_system_etc_init_loaded(
@@ -1204,7 +1112,9 @@ int main(int argc, char** argv) {
         parser.set_is_odm_etc_init_loaded(true);
     }
 
-    ActionManager& am = ActionManager::GetInstance();
+    // Turning this on and letting the INFO logging be discarded adds 0.2s to
+    // Nexus 9 boot time, so it's disabled by default.
+    if (false) DumpState();
 
     am.QueueEventTrigger("early-init");
 
@@ -1225,7 +1135,7 @@ int main(int argc, char** argv) {
     am.QueueBuiltinAction(mix_hwrng_into_linux_rng_action, "mix_hwrng_into_linux_rng");
 
     // Don't mount filesystems or start core system services in charger mode.
-    std::string bootmode = property_get("ro.bootmode");
+    std::string bootmode = GetProperty("ro.bootmode", "");
     if (bootmode == "charger" || charging_mode_booting()) {
         am.QueueEventTrigger("charger");
     } else {
@@ -1236,22 +1146,24 @@ int main(int argc, char** argv) {
     am.QueueBuiltinAction(queue_property_triggers_action, "queue_property_triggers");
 
     while (true) {
-        if (!(waiting_for_exec || waiting_for_prop)) {
-            am.ExecuteOneCommand();
-            restart_processes();
-        }
-
         // By default, sleep until something happens.
         int epoll_timeout_ms = -1;
 
-        // If there's a process that needs restarting, wake up in time for that.
-        if (process_needs_restart_at != 0) {
-            epoll_timeout_ms = (process_needs_restart_at - time(nullptr)) * 1000;
-            if (epoll_timeout_ms < 0) epoll_timeout_ms = 0;
+        if (!(waiting_for_prop || sm.IsWaitingForExec())) {
+            am.ExecuteOneCommand();
         }
+        if (!(waiting_for_prop || sm.IsWaitingForExec())) {
+            restart_processes();
 
-        // If there's more work to do, wake up again immediately.
-        if (am.HasMoreCommands()) epoll_timeout_ms = 0;
+            // If there's a process that needs restarting, wake up in time for that.
+            if (process_needs_restart_at != 0) {
+                epoll_timeout_ms = (process_needs_restart_at - time(nullptr)) * 1000;
+                if (epoll_timeout_ms < 0) epoll_timeout_ms = 0;
+            }
+
+            // If there's more work to do, wake up again immediately.
+            if (am.HasMoreCommands()) epoll_timeout_ms = 0;
+        }
 
         epoll_event ev;
         int nr = TEMP_FAILURE_RETRY(epoll_wait(epoll_fd, &ev, 1, epoll_timeout_ms));

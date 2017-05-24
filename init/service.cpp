@@ -24,29 +24,27 @@
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/system_properties.h>
 #include <sys/time.h>
-#include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 
-#include <selinux/selinux.h>
-
 #include <android-base/file.h>
+#include <android-base/logging.h>
 #include <android-base/parseint.h>
+#include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
+#include <processgroup/processgroup.h>
+#include <selinux/selinux.h>
 #include <system/thread_defs.h>
 
-#include <processgroup/processgroup.h>
-
-#include "action.h"
 #include "init.h"
-#include "init_parser.h"
-#include "log.h"
 #include "property_service.h"
 #include "util.h"
 
+using android::base::boot_clock;
 using android::base::ParseInt;
 using android::base::StringPrintf;
 using android::base::WriteStringToFile;
@@ -149,33 +147,54 @@ ServiceEnvironmentInfo::ServiceEnvironmentInfo(const std::string& name,
     : name(name), value(value) {
 }
 
-Service::Service(const std::string& name, const std::string& classname,
-                 const std::vector<std::string>& args)
-    : name_(name), classname_(classname), flags_(0), pid_(0),
-      crash_count_(0), uid_(0), gid_(0), namespace_flags_(0),
-      seclabel_(""), ioprio_class_(IoSchedClass_NONE), ioprio_pri_(0),
-      priority_(0), oom_score_adjust_(-1000), args_(args) {
+Service::Service(const std::string& name, const std::vector<std::string>& args)
+    : name_(name),
+      classnames_({"default"}),
+      flags_(0),
+      pid_(0),
+      crash_count_(0),
+      uid_(0),
+      gid_(0),
+      namespace_flags_(0),
+      seclabel_(""),
+      onrestart_(false, "<Service '" + name + "' onrestart>", 0),
+      keychord_id_(0),
+      ioprio_class_(IoSchedClass_NONE),
+      ioprio_pri_(0),
+      priority_(0),
+      oom_score_adjust_(-1000),
+      args_(args) {
     onrestart_.InitSingleTrigger("onrestart");
 }
 
-Service::Service(const std::string& name, const std::string& classname,
-                 unsigned flags, uid_t uid, gid_t gid,
-                 const std::vector<gid_t>& supp_gids,
-                 const CapSet& capabilities, unsigned namespace_flags,
-                 const std::string& seclabel,
+Service::Service(const std::string& name, unsigned flags, uid_t uid, gid_t gid,
+                 const std::vector<gid_t>& supp_gids, const CapSet& capabilities,
+                 unsigned namespace_flags, const std::string& seclabel,
                  const std::vector<std::string>& args)
-    : name_(name), classname_(classname), flags_(flags), pid_(0),
-      crash_count_(0), uid_(uid), gid_(gid),
-      supp_gids_(supp_gids), capabilities_(capabilities),
-      namespace_flags_(namespace_flags), seclabel_(seclabel),
-      ioprio_class_(IoSchedClass_NONE), ioprio_pri_(0), priority_(0),
-      oom_score_adjust_(-1000), args_(args) {
+    : name_(name),
+      classnames_({"default"}),
+      flags_(flags),
+      pid_(0),
+      crash_count_(0),
+      uid_(uid),
+      gid_(gid),
+      supp_gids_(supp_gids),
+      capabilities_(capabilities),
+      namespace_flags_(namespace_flags),
+      seclabel_(seclabel),
+      onrestart_(false, "<Service '" + name + "' onrestart>", 0),
+      keychord_id_(0),
+      ioprio_class_(IoSchedClass_NONE),
+      ioprio_pri_(0),
+      priority_(0),
+      oom_score_adjust_(-1000),
+      args_(args) {
     onrestart_.InitSingleTrigger("onrestart");
 }
 
 void Service::NotifyStateChange(const std::string& new_state) const {
-    if ((flags_ & SVC_EXEC) != 0) {
-        // 'exec' commands don't have properties tracking their state.
+    if ((flags_ & SVC_TEMPORARY) != 0) {
+        // Services created by 'exec' are temporary and don't have properties tracking their state.
         return;
     }
 
@@ -193,8 +212,14 @@ void Service::KillProcessGroup(int signal) {
     LOG(INFO) << "Sending signal " << signal
               << " to service '" << name_
               << "' (pid " << pid_ << ") process group...";
-    if (killProcessGroup(uid_, pid_, signal) == -1) {
-        PLOG(ERROR) << "killProcessGroup(" << uid_ << ", " << pid_ << ", " << signal << ") failed";
+    int r;
+    if (signal == SIGTERM) {
+        r = killProcessGroupOnce(uid_, pid_, signal);
+    } else {
+        r = killProcessGroup(uid_, pid_, signal);
+    }
+    if (r == -1) {
+        LOG(ERROR) << "killProcessGroup(" << uid_ << ", " << pid_ << ", " << signal << ") failed";
     }
     if (kill(-pid_, signal) == -1) {
         PLOG(ERROR) << "kill(" << pid_ << ", " << signal << ") failed";
@@ -242,7 +267,7 @@ void Service::SetProcessAttributes() {
     }
 }
 
-bool Service::Reap() {
+void Service::Reap() {
     if (!(flags_ & SVC_ONESHOT) || (flags_ & SVC_RESTART)) {
         KillProcessGroup(SIGKILL);
     }
@@ -251,9 +276,8 @@ bool Service::Reap() {
     std::for_each(descriptors_.begin(), descriptors_.end(),
                   std::bind(&DescriptorInfo::Clean, std::placeholders::_1));
 
-    if (flags_ & SVC_EXEC) {
-        LOG(INFO) << "SVC_EXEC pid " << pid_ << " finished...";
-        return true;
+    if (flags_ & SVC_TEMPORARY) {
+        return;
     }
 
     pid_ = 0;
@@ -268,7 +292,7 @@ bool Service::Reap() {
     // Disabled and reset processes do not get restarted automatically.
     if (flags_ & (SVC_DISABLED | SVC_RESET))  {
         NotifyStateChange("stopped");
-        return false;
+        return;
     }
 
     // If we crash > 4 times in 4 minutes, reboot into recovery.
@@ -292,12 +316,12 @@ bool Service::Reap() {
     onrestart_.ExecuteAllCommands();
 
     NotifyStateChange("restarting");
-    return false;
+    return;
 }
 
 void Service::DumpState() const {
     LOG(INFO) << "service " << name_;
-    LOG(INFO) << "  class '" << classname_ << "'";
+    LOG(INFO) << "  class '" << android::base::Join(classnames_, " ") << "'";
     LOG(INFO) << "  exec "<< android::base::Join(args_, " ");
     std::for_each(descriptors_.begin(), descriptors_.end(),
                   [] (const auto& info) { LOG(INFO) << *info; });
@@ -334,7 +358,7 @@ bool Service::ParseCapabilities(const std::vector<std::string>& args, std::strin
 }
 
 bool Service::ParseClass(const std::vector<std::string>& args, std::string* err) {
-    classname_ = args[1];
+    classnames_ = std::set<std::string>(args.begin() + 1, args.end());
     return true;
 }
 
@@ -414,7 +438,8 @@ bool Service::ParseOneshot(const std::vector<std::string>& args, std::string* er
 
 bool Service::ParseOnrestart(const std::vector<std::string>& args, std::string* err) {
     std::vector<std::string> str_args(args.begin() + 1, args.end());
-    onrestart_.AddCommand(str_args, "", 0, err);
+    int line = onrestart_.NumCommands() + 1;
+    onrestart_.AddCommand(str_args, line, err);
     return true;
 }
 
@@ -507,19 +532,20 @@ bool Service::ParseWritepid(const std::vector<std::string>& args, std::string* e
 }
 
 class Service::OptionParserMap : public KeywordMap<OptionParser> {
-public:
-    OptionParserMap() {
-    }
-private:
-    Map& map() const override;
+  public:
+    OptionParserMap() {}
+
+  private:
+    const Map& map() const override;
 };
 
-Service::OptionParserMap::Map& Service::OptionParserMap::map() const {
+const Service::OptionParserMap::Map& Service::OptionParserMap::map() const {
     constexpr std::size_t kMax = std::numeric_limits<std::size_t>::max();
+    // clang-format off
     static const Map option_parsers = {
         {"capabilities",
                         {1,     kMax, &Service::ParseCapabilities}},
-        {"class",       {1,     1,    &Service::ParseClass}},
+        {"class",       {1,     kMax, &Service::ParseClass}},
         {"console",     {0,     1,    &Service::ParseConsole}},
         {"critical",    {0,     0,    &Service::ParseCritical}},
         {"disabled",    {0,     0,    &Service::ParseDisabled}},
@@ -539,23 +565,31 @@ Service::OptionParserMap::Map& Service::OptionParserMap::map() const {
         {"user",        {1,     1,    &Service::ParseUser}},
         {"writepid",    {1,     kMax, &Service::ParseWritepid}},
     };
+    // clang-format on
     return option_parsers;
 }
 
 bool Service::ParseLine(const std::vector<std::string>& args, std::string* err) {
-    if (args.empty()) {
-        *err = "option needed, but not provided";
-        return false;
-    }
-
     static const OptionParserMap parser_map;
-    auto parser = parser_map.FindFunction(args[0], args.size() - 1, err);
+    auto parser = parser_map.FindFunction(args, err);
 
     if (!parser) {
         return false;
     }
 
     return (this->*parser)(args, err);
+}
+
+bool Service::ExecStart(std::unique_ptr<Timer>* exec_waiter) {
+    flags_ |= SVC_EXEC | SVC_ONESHOT;
+
+    exec_waiter->reset(new Timer);
+
+    if (!Start()) {
+        exec_waiter->reset();
+        return false;
+    }
+    return true;
 }
 
 bool Service::Start() {
@@ -598,7 +632,6 @@ bool Service::Start() {
     if (!seclabel_.empty()) {
         scon = seclabel_;
     } else {
-        LOG(INFO) << "computing context for service '" << name_ << "'";
         scon = ComputeContextFromExecutable(name_, args_[0]);
         if (scon == "") {
             return false;
@@ -630,6 +663,28 @@ bool Service::Start() {
         std::for_each(descriptors_.begin(), descriptors_.end(),
                       std::bind(&DescriptorInfo::CreateAndPublish, std::placeholders::_1, scon));
 
+        // See if there were "writepid" instructions to write to files under /dev/cpuset/.
+        auto cpuset_predicate = [](const std::string& path) {
+            return android::base::StartsWith(path, "/dev/cpuset/");
+        };
+        auto iter = std::find_if(writepid_files_.begin(), writepid_files_.end(), cpuset_predicate);
+        if (iter == writepid_files_.end()) {
+            // There were no "writepid" instructions for cpusets, check if the system default
+            // cpuset is specified to be used for the process.
+            std::string default_cpuset = android::base::GetProperty("ro.cpuset.default", "");
+            if (!default_cpuset.empty()) {
+                // Make sure the cpuset name starts and ends with '/'.
+                // A single '/' means the 'root' cpuset.
+                if (default_cpuset.front() != '/') {
+                    default_cpuset.insert(0, 1, '/');
+                }
+                if (default_cpuset.back() != '/') {
+                    default_cpuset.push_back('/');
+                }
+                writepid_files_.push_back(
+                    StringPrintf("/dev/cpuset%stasks", default_cpuset.c_str()));
+            }
+        }
         std::string pid_str = StringPrintf("%d", getpid());
         for (const auto& file : writepid_files_) {
             if (!WriteStringToFile(pid_str, file)) {
@@ -814,13 +869,37 @@ ServiceManager& ServiceManager::GetInstance() {
 }
 
 void ServiceManager::AddService(std::unique_ptr<Service> service) {
-    Service* old_service = FindServiceByName(service->name());
-    if (old_service) {
-        LOG(ERROR) << "ignored duplicate definition of service '" << service->name() << "'";
-        return;
-    }
     services_.emplace_back(std::move(service));
 }
+
+bool ServiceManager::Exec(const std::vector<std::string>& args) {
+    Service* svc = MakeExecOneshotService(args);
+    if (!svc) {
+        LOG(ERROR) << "Could not create exec service";
+        return false;
+    }
+    if (!svc->ExecStart(&exec_waiter_)) {
+        LOG(ERROR) << "Could not start exec service";
+        ServiceManager::GetInstance().RemoveService(*svc);
+        return false;
+    }
+    return true;
+}
+
+bool ServiceManager::ExecStart(const std::string& name) {
+    Service* svc = FindServiceByName(name);
+    if (!svc) {
+        LOG(ERROR) << "ExecStart(" << name << "): Service not found";
+        return false;
+    }
+    if (!svc->ExecStart(&exec_waiter_)) {
+        LOG(ERROR) << "ExecStart(" << name << "): Could not start Service";
+        return false;
+    }
+    return true;
+}
+
+bool ServiceManager::IsWaitingForExec() const { return exec_waiter_ != nullptr; }
 
 Service* ServiceManager::MakeExecOneshotService(const std::vector<std::string>& args) {
     // Parse the arguments: exec [SECLABEL [UID [GID]*] --] COMMAND ARGS...
@@ -844,8 +923,10 @@ Service* ServiceManager::MakeExecOneshotService(const std::vector<std::string>& 
     std::vector<std::string> str_args(args.begin() + command_arg, args.end());
 
     exec_count_++;
-    std::string name = StringPrintf("exec %d (%s)", exec_count_, str_args[0].c_str());
-    unsigned flags = SVC_EXEC | SVC_ONESHOT;
+    std::string name =
+        "exec " + std::to_string(exec_count_) + " (" + android::base::Join(str_args, " ") + ")";
+
+    unsigned flags = SVC_EXEC | SVC_ONESHOT | SVC_TEMPORARY;
     CapSet no_capabilities;
     unsigned namespace_flags = 0;
 
@@ -867,15 +948,10 @@ Service* ServiceManager::MakeExecOneshotService(const std::vector<std::string>& 
         }
     }
 
-    std::unique_ptr<Service> svc_p(new Service(name, "default", flags, uid, gid, supp_gids,
-                                               no_capabilities, namespace_flags, seclabel,
-                                               str_args));
-    if (!svc_p) {
-        LOG(ERROR) << "Couldn't allocate service for exec of '" << str_args[0] << "'";
-        return nullptr;
-    }
+    auto svc_p = std::make_unique<Service>(name, flags, uid, gid, supp_gids, no_capabilities,
+                                           namespace_flags, seclabel, str_args);
     Service* svc = svc_p.get();
-    services_.push_back(std::move(svc_p));
+    services_.emplace_back(std::move(svc_p));
 
     return svc;
 }
@@ -923,7 +999,7 @@ void ServiceManager::ForEachService(const std::function<void(Service*)>& callbac
 void ServiceManager::ForEachServiceInClass(const std::string& classname,
                                            void (*func)(Service* svc)) const {
     for (const auto& s : services_) {
-        if (classname == s->classname()) {
+        if (s->classnames().find(classname) != s->classnames().end()) {
             func(s.get());
         }
     }
@@ -969,29 +1045,38 @@ bool ServiceManager::ReapOneProcess() {
     Service* svc = FindServiceByPid(pid);
 
     std::string name;
+    std::string wait_string;
     if (svc) {
         name = android::base::StringPrintf("Service '%s' (pid %d)",
                                            svc->name().c_str(), pid);
+        if (svc->flags() & SVC_EXEC) {
+            wait_string =
+                android::base::StringPrintf(" waiting took %f seconds", exec_waiter_->duration_s());
+        }
     } else {
         name = android::base::StringPrintf("Untracked pid %d", pid);
     }
 
     if (WIFEXITED(status)) {
-        LOG(INFO) << name << " exited with status " << WEXITSTATUS(status);
+        LOG(INFO) << name << " exited with status " << WEXITSTATUS(status) << wait_string;
     } else if (WIFSIGNALED(status)) {
-        LOG(INFO) << name << " killed by signal " << WTERMSIG(status);
+        LOG(INFO) << name << " killed by signal " << WTERMSIG(status) << wait_string;
     } else if (WIFSTOPPED(status)) {
-        LOG(INFO) << name << " stopped by signal " << WSTOPSIG(status);
+        LOG(INFO) << name << " stopped by signal " << WSTOPSIG(status) << wait_string;
     } else {
-        LOG(INFO) << name << " state changed";
+        LOG(INFO) << name << " state changed" << wait_string;
     }
 
     if (!svc) {
         return true;
     }
 
-    if (svc->Reap()) {
-        stop_waiting_for_exec();
+    svc->Reap();
+
+    if (svc->flags() & SVC_EXEC) {
+        exec_waiter_.reset();
+    }
+    if (svc->flags() & SVC_TEMPORARY) {
         RemoveService(*svc);
     }
 
@@ -1003,8 +1088,8 @@ void ServiceManager::ReapAnyOutstandingChildren() {
     }
 }
 
-bool ServiceParser::ParseSection(const std::vector<std::string>& args,
-                                 std::string* err) {
+bool ServiceParser::ParseSection(std::vector<std::string>&& args, const std::string& filename,
+                                 int line, std::string* err) {
     if (args.size() < 3) {
         *err = "services must have a name and a program";
         return false;
@@ -1016,20 +1101,24 @@ bool ServiceParser::ParseSection(const std::vector<std::string>& args,
         return false;
     }
 
+    Service* old_service = service_manager_->FindServiceByName(name);
+    if (old_service) {
+        *err = "ignored duplicate definition of service '" + name + "'";
+        return false;
+    }
+
     std::vector<std::string> str_args(args.begin() + 2, args.end());
-    service_ = std::make_unique<Service>(name, "default", str_args);
+    service_ = std::make_unique<Service>(name, str_args);
     return true;
 }
 
-bool ServiceParser::ParseLineSection(const std::vector<std::string>& args,
-                                     const std::string& filename, int line,
-                                     std::string* err) const {
-    return service_ ? service_->ParseLine(args, err) : false;
+bool ServiceParser::ParseLineSection(std::vector<std::string>&& args, int line, std::string* err) {
+    return service_ ? service_->ParseLine(std::move(args), err) : false;
 }
 
 void ServiceParser::EndSection() {
     if (service_) {
-        ServiceManager::GetInstance().AddService(std::move(service_));
+        service_manager_->AddService(std::move(service_));
     }
 }
 

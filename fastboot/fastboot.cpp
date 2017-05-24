@@ -26,8 +26,6 @@
  * SUCH DAMAGE.
  */
 
-#define _LARGEFILE64_SOURCE
-
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -55,6 +53,7 @@
 #include <android-base/parsenetaddress.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
+#include <android-base/unique_fd.h>
 #include <sparse/sparse.h>
 #include <ziparchive/zip_archive.h>
 
@@ -67,6 +66,8 @@
 #include "udp.h"
 #include "usb.h"
 
+using android::base::unique_fd;
+
 #ifndef O_BINARY
 #define O_BINARY 0
 #endif
@@ -78,6 +79,10 @@ static const char* product = nullptr;
 static const char* cmdline = nullptr;
 static unsigned short vendor_id = 0;
 static int long_listing = 0;
+// Don't resparse files in too-big chunks.
+// libsparse will support INT_MAX, but this results in large allocations, so
+// let's keep it at 1GB to avoid memory pressure on the host.
+static constexpr int64_t RESPARSE_LIMIT = 1 * 1024 * 1024 * 1024;
 static int64_t sparse_limit = -1;
 static int64_t target_sparse_limit = -1;
 
@@ -91,7 +96,7 @@ static unsigned tags_offset    = 0x00000100;
 static const std::string convert_fbe_marker_filename("convert_fbe");
 
 enum fb_buffer_type {
-    FB_BUFFER,
+    FB_BUFFER_FD,
     FB_BUFFER_SPARSE,
 };
 
@@ -99,6 +104,7 @@ struct fastboot_buffer {
     enum fb_buffer_type type;
     void* data;
     int64_t sz;
+    int fd;
 };
 
 static struct {
@@ -115,6 +121,8 @@ static struct {
     {"system_other.img", "system.sig", "system", true, true},
     {"vendor.img", "vendor.sig", "vendor", true, false},
     {"vendor_other.img", "vendor.sig", "vendor", true, true},
+    {"vbmeta.img", "vbmeta.sig", "vbmeta", true, false},
+    {"dtbo.img", "dtbo.sig", "dtbo", true, false},
 };
 
 static std::string find_item_given_name(const char* img_name, const char* product) {
@@ -144,6 +152,10 @@ std::string find_item(const char* item, const char* product) {
         fn = "system.img";
     } else if(!strcmp(item,"vendor")) {
         fn = "vendor.img";
+    } else if(!strcmp(item,"vbmeta")) {
+        fn = "vbmeta.img";
+    } else if(!strcmp(item,"dtbo")) {
+        fn = "dtbo.img";
     } else if(!strcmp(item,"userdata")) {
         fn = "userdata.img";
     } else if(!strcmp(item,"cache")) {
@@ -360,6 +372,13 @@ static void usage() {
             "  continue                                 Continue with autoboot.\n"
             "  reboot [bootloader|emergency]            Reboot device [into bootloader or emergency mode].\n"
             "  reboot-bootloader                        Reboot device into bootloader.\n"
+            "  oem <parameter1> ... <parameterN>        Executes oem specific command.\n"
+            "  stage <infile>                           Sends contents of <infile> to stage for\n"
+            "                                           the next command. Supported only on\n"
+            "                                           Android Things devices.\n"
+            "  get_staged <outfile>                     Receives data to <outfile> staged by the\n"
+            "                                           last command. Supported only on Android\n"
+            "                                           Things devices.\n"
             "  help                                     Show this help message.\n"
             "\n"
             "options:\n"
@@ -483,8 +502,7 @@ static void* load_bootable_image(const char* kernel, const char* ramdisk,
     return bdata;
 }
 
-static void* unzip_file(ZipArchiveHandle zip, const char* entry_name, int64_t* sz)
-{
+static void* unzip_file(ZipArchiveHandle zip, const char* entry_name, int64_t* sz) {
     ZipString zip_entry_name(entry_name);
     ZipEntry zip_entry;
     if (FindEntry(zip, zip_entry_name, &zip_entry) != 0) {
@@ -494,6 +512,7 @@ static void* unzip_file(ZipArchiveHandle zip, const char* entry_name, int64_t* s
 
     *sz = zip_entry.uncompressed_length;
 
+    fprintf(stderr, "extracting %s (%" PRId64 " MB)...\n", entry_name, *sz / 1024 / 1024);
     uint8_t* data = reinterpret_cast<uint8_t*>(malloc(zip_entry.uncompressed_length));
     if (data == nullptr) {
         fprintf(stderr, "failed to allocate %" PRId64 " bytes for '%s'\n", *sz, entry_name);
@@ -542,20 +561,37 @@ static std::string make_temporary_directory() {
     return "";
 }
 
+static int make_temporary_fd() {
+    // TODO: reimplement to avoid leaking a FILE*.
+    return fileno(tmpfile());
+}
+
 #else
 
+static std::string make_temporary_template() {
+    const char* tmpdir = getenv("TMPDIR");
+    if (tmpdir == nullptr) tmpdir = P_tmpdir;
+    return std::string(tmpdir) + "/fastboot_userdata_XXXXXX";
+}
+
 static std::string make_temporary_directory() {
-    const char *tmpdir = getenv("TMPDIR");
-    if (tmpdir == nullptr) {
-        tmpdir = P_tmpdir;
-    }
-    std::string result = std::string(tmpdir) + "/fastboot_userdata_XXXXXX";
-    if (mkdtemp(&result[0]) == NULL) {
-        fprintf(stderr, "Unable to create temporary directory: %s\n",
-            strerror(errno));
+    std::string result(make_temporary_template());
+    if (mkdtemp(&result[0]) == nullptr) {
+        fprintf(stderr, "Unable to create temporary directory: %s\n", strerror(errno));
         return "";
     }
     return result;
+}
+
+static int make_temporary_fd() {
+    std::string path_template(make_temporary_template());
+    int fd = mkstemp(&path_template[0]);
+    if (fd == -1) {
+        fprintf(stderr, "Unable to create temporary file: %s\n", strerror(errno));
+        return -1;
+    }
+    unlink(path_template.c_str());
+    return fd;
 }
 
 #endif
@@ -592,8 +628,8 @@ static void delete_fbemarker_tmpdir(const std::string& dir) {
 }
 
 static int unzip_to_file(ZipArchiveHandle zip, char* entry_name) {
-    FILE* fp = tmpfile();
-    if (fp == nullptr) {
+    unique_fd fd(make_temporary_fd());
+    if (fd == -1) {
         fprintf(stderr, "failed to create temporary file for '%s': %s\n",
                 entry_name, strerror(errno));
         return -1;
@@ -603,21 +639,20 @@ static int unzip_to_file(ZipArchiveHandle zip, char* entry_name) {
     ZipEntry zip_entry;
     if (FindEntry(zip, zip_entry_name, &zip_entry) != 0) {
         fprintf(stderr, "archive does not contain '%s'\n", entry_name);
-        fclose(fp);
         return -1;
     }
 
-    int fd = fileno(fp);
+    fprintf(stderr, "extracting %s (%" PRIu32 " MB)...\n", entry_name,
+            zip_entry.uncompressed_length / 1024 / 1024);
     int error = ExtractEntryToFile(zip, &zip_entry, fd);
     if (error != 0) {
         fprintf(stderr, "failed to extract '%s': %s\n", entry_name, ErrorCodeString(error));
-        fclose(fp);
         return -1;
     }
 
     lseek(fd, 0, SEEK_SET);
     // TODO: We're leaking 'fp' here.
-    return fd;
+    return fd.release();
 }
 
 static char *strip(char *s)
@@ -786,7 +821,7 @@ static int64_t get_sparse_limit(Transport* transport, int64_t size) {
     }
 
     if (size > limit) {
-        return limit;
+        return std::min(limit, RESPARSE_LIMIT);
     }
 
     return 0;
@@ -819,10 +854,9 @@ static bool load_buf_fd(Transport* transport, int fd, struct fastboot_buffer* bu
         buf->type = FB_BUFFER_SPARSE;
         buf->data = s;
     } else {
-        void* data = load_fd(fd, &sz);
-        if (data == nullptr) return -1;
-        buf->type = FB_BUFFER;
-        buf->data = data;
+        buf->type = FB_BUFFER_FD;
+        buf->data = nullptr;
+        buf->fd = fd;
         buf->sz = sz;
     }
 
@@ -830,11 +864,22 @@ static bool load_buf_fd(Transport* transport, int fd, struct fastboot_buffer* bu
 }
 
 static bool load_buf(Transport* transport, const char* fname, struct fastboot_buffer* buf) {
-    int fd = open(fname, O_RDONLY | O_BINARY);
+    unique_fd fd(TEMP_FAILURE_RETRY(open(fname, O_RDONLY | O_BINARY)));
+
     if (fd == -1) {
         return false;
     }
-    return load_buf_fd(transport, fd, buf);
+
+    struct stat s;
+    if (fstat(fd, &s)) {
+        return false;
+    }
+    if (!S_ISREG(s.st_mode)) {
+        errno = S_ISDIR(s.st_mode) ? EISDIR : EINVAL;
+        return false;
+    }
+
+    return load_buf_fd(transport, fd.release(), buf);
 }
 
 static void flash_buf(const char *pname, struct fastboot_buffer *buf)
@@ -857,9 +902,8 @@ static void flash_buf(const char *pname, struct fastboot_buffer *buf)
             }
             break;
         }
-
-        case FB_BUFFER:
-            fb_queue_flash(pname, buf->data, buf->sz);
+        case FB_BUFFER_FD:
+            fb_queue_flash_fd(pname, buf->fd, buf->sz);
             break;
         default:
             die("unknown buffer type: %d", buf->type);
@@ -1131,7 +1175,7 @@ static void do_update(Transport* transport, const char* filename, const std::str
             }
             flash_buf(partition.c_str(), &buf);
             /* not closing the fd here since the sparse code keeps the fd around
-             * but hasn't mmaped data yet. The tmpfile will get cleaned up when the
+             * but hasn't mmaped data yet. The temporary file will get cleaned up when the
              * program exits.
              */
         };
@@ -1245,20 +1289,17 @@ static int do_bypass_unlock_command(int argc, char **argv)
     return 0;
 }
 
-static int do_oem_command(int argc, char **argv)
-{
-    char command[256];
+static int do_oem_command(int argc, char** argv) {
     if (argc <= 1) return 0;
 
-    command[0] = 0;
-    while(1) {
-        strcat(command,*argv);
+    std::string command;
+    while (argc > 0) {
+        command += *argv;
         skip(1);
-        if(argc == 0) break;
-        strcat(command," ");
+        if (argc != 0) command += " ";
     }
 
-    fb_queue_command(command,"");
+    fb_queue_command(command.c_str(), "");
     return 0;
 }
 
@@ -1395,7 +1436,8 @@ static void fb_perform_format(Transport* transport,
         return;
     }
 
-    fd = fileno(tmpfile());
+    fd = make_temporary_fd();
+    if (fd == -1) return;
 
     unsigned eraseBlkSize, logicalBlkSize;
     eraseBlkSize = fb_get_flash_block_size(transport, "erase-block-size");
@@ -1539,6 +1581,7 @@ int main(int argc, char **argv)
                 setvbuf(stderr, nullptr, _IONBF, 0);
             } else if (strcmp("version", longopts[longindex].name) == 0) {
                 fprintf(stdout, "fastboot version %s\n", FASTBOOT_REVISION);
+                fprintf(stdout, "Installed as %s\n", android::base::GetExecutablePath().c_str());
                 return 0;
             } else if (strcmp("slot", longopts[longindex].name) == 0) {
                 slot_override = std::string(optarg);
@@ -1788,6 +1831,20 @@ int main(int argc, char **argv)
             }
             fb_set_active(slot.c_str());
             skip(2);
+        } else if(!strcmp(*argv, "stage")) {
+            require(2);
+            std::string infile(argv[1]);
+            skip(2);
+            struct fastboot_buffer buf;
+            if (!load_buf(transport, infile.c_str(), &buf) || buf.type != FB_BUFFER_FD) {
+                die("cannot load '%s'", infile.c_str());
+            }
+            fb_queue_download_fd(infile.c_str(), buf.fd, buf.sz);
+        } else if(!strcmp(*argv, "get_staged")) {
+            require(2);
+            char *outfile = argv[1];
+            skip(2);
+            fb_queue_upload(outfile);
         } else if(!strcmp(*argv, "oem")) {
             argc = do_oem_command(argc, argv);
         } else if(!strcmp(*argv, "flashing")) {

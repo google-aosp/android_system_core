@@ -14,18 +14,17 @@
  * limitations under the License.
  */
 
-#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <linux/keychord.h>
 #include <unistd.h>
 
+#include <android-base/logging.h>
+#include <android-base/properties.h>
+
 #include "init.h"
-#include "log.h"
-#include "property_service.h"
 #include "service.h"
 
 static struct input_keychord *keychords = 0;
@@ -74,7 +73,7 @@ static void handle_keychord() {
     }
 
     // Only handle keychords if adb is enabled.
-    std::string adb_enabled = property_get("init.svc.adbd");
+    std::string adb_enabled = android::base::GetProperty("init.svc.adbd", "");
     if (adb_enabled == "running") {
         Service* svc = ServiceManager::GetInstance().FindServiceByKeychord(id);
         if (svc) {

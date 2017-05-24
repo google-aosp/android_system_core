@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include <limits>
+#include <map>
 #include <memory>
 #include <set>
 #include <vector>
@@ -36,6 +37,7 @@
 #include <android-base/parseint.h>
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
+#include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 #include <cutils/sockets.h>
 #include <log/log.h>
@@ -48,10 +50,25 @@
 
 #include "debuggerd/handler.h"
 #include "debuggerd/protocol.h"
+#include "debuggerd/tombstoned.h"
 #include "debuggerd/util.h"
 
 using android::base::unique_fd;
+using android::base::ReadFileToString;
 using android::base::StringPrintf;
+using android::base::Trim;
+
+static std::string get_process_name(pid_t pid) {
+  std::string result = "<unknown>";
+  ReadFileToString(StringPrintf("/proc/%d/cmdline", pid), &result);
+  return result;
+}
+
+static std::string get_thread_name(pid_t tid) {
+  std::string result = "<unknown>";
+  ReadFileToString(StringPrintf("/proc/%d/comm", tid), &result);
+  return Trim(result);
+}
 
 static bool pid_contains_tid(int pid_proc_fd, pid_t tid) {
   struct stat st;
@@ -128,55 +145,6 @@ static bool activity_manager_notify(int pid, int signal, const std::string& amfd
   return true;
 }
 
-static bool tombstoned_connect(pid_t pid, unique_fd* tombstoned_socket, unique_fd* output_fd) {
-  unique_fd sockfd(socket_local_client(kTombstonedCrashSocketName,
-                                       ANDROID_SOCKET_NAMESPACE_RESERVED, SOCK_SEQPACKET));
-  if (sockfd == -1) {
-    PLOG(ERROR) << "failed to connect to tombstoned";
-    return false;
-  }
-
-  TombstonedCrashPacket packet = {};
-  packet.packet_type = CrashPacketType::kDumpRequest;
-  packet.packet.dump_request.pid = pid;
-  if (TEMP_FAILURE_RETRY(write(sockfd, &packet, sizeof(packet))) != sizeof(packet)) {
-    PLOG(ERROR) << "failed to write DumpRequest packet";
-    return false;
-  }
-
-  unique_fd tmp_output_fd;
-  ssize_t rc = recv_fd(sockfd, &packet, sizeof(packet), &tmp_output_fd);
-  if (rc == -1) {
-    PLOG(ERROR) << "failed to read response to DumpRequest packet";
-    return false;
-  } else if (rc != sizeof(packet)) {
-    LOG(ERROR) << "read DumpRequest response packet of incorrect length (expected "
-               << sizeof(packet) << ", got " << rc << ")";
-    return false;
-  }
-
-  // Make the fd O_APPEND so that our output is guaranteed to be at the end of a file.
-  // (This also makes selinux rules consistent, because selinux distinguishes between writing to
-  // a regular fd, and writing to an fd with O_APPEND).
-  int flags = fcntl(tmp_output_fd.get(), F_GETFL);
-  if (fcntl(tmp_output_fd.get(), F_SETFL, flags | O_APPEND) != 0) {
-    PLOG(WARNING) << "failed to set output fd flags";
-  }
-
-  *tombstoned_socket = std::move(sockfd);
-  *output_fd = std::move(tmp_output_fd);
-  return true;
-}
-
-static bool tombstoned_notify_completion(int tombstoned_socket) {
-  TombstonedCrashPacket packet = {};
-  packet.packet_type = CrashPacketType::kCompletedDump;
-  if (TEMP_FAILURE_RETRY(write(tombstoned_socket, &packet, sizeof(packet))) != sizeof(packet)) {
-    return false;
-  }
-  return true;
-}
-
 static void signal_handler(int) {
   // We can't log easily, because the heap might be corrupt.
   // Just die and let the surrounding log context explain things.
@@ -196,7 +164,12 @@ static void abort_handler(pid_t target, const bool& tombstoned_connected,
     }
   }
 
-  dprintf(output_fd.get(), "crash_dump failed to dump process %d: %s\n", target, abort_msg);
+  dprintf(output_fd.get(), "crash_dump failed to dump process");
+  if (target != 1) {
+    dprintf(output_fd.get(), " %d: %s\n", target, abort_msg);
+  } else {
+    dprintf(output_fd.get(), ": %s\n", abort_msg);
+  }
 
   _exit(1);
 }
@@ -242,16 +215,16 @@ int main(int argc, char** argv) {
   pid_t main_tid;
   pid_t pseudothread_tid;
 
-  if (target == 1) {
-    LOG(FATAL) << "target died before we could attach";
-  }
-
   if (!android::base::ParseInt(argv[1], &main_tid, 1, std::numeric_limits<pid_t>::max())) {
     LOG(FATAL) << "invalid main tid: " << argv[1];
   }
 
   if (!android::base::ParseInt(argv[2], &pseudothread_tid, 1, std::numeric_limits<pid_t>::max())) {
     LOG(FATAL) << "invalid pseudothread tid: " << argv[2];
+  }
+
+  if (target == 1) {
+    LOG(FATAL) << "target died before we could attach (received main tid = " << main_tid << ")";
   }
 
   android::procinfo::ProcessInfo target_info;
@@ -296,7 +269,7 @@ int main(int argc, char** argv) {
   }
 
   // Seize the siblings.
-  std::set<pid_t> attached_siblings;
+  std::map<pid_t, std::string> threads;
   {
     std::set<pid_t> siblings;
     if (!android::procinfo::GetProcessTids(target, &siblings)) {
@@ -312,12 +285,12 @@ int main(int argc, char** argv) {
       if (!ptrace_seize_thread(target_proc_fd, sibling_tid, &attach_error)) {
         LOG(WARNING) << attach_error;
       } else {
-        attached_siblings.insert(sibling_tid);
+        threads.emplace(sibling_tid, get_thread_name(sibling_tid));
       }
     }
   }
 
-  // Collect the backtrace map and open files, while the process still has PR_GET_DUMPABLE=1
+  // Collect the backtrace map, open files, and process/thread names, while we still have caps.
   std::unique_ptr<BacktraceMap> backtrace_map(BacktraceMap::Create(main_tid));
   if (!backtrace_map) {
     LOG(FATAL) << "failed to create backtrace map";
@@ -326,6 +299,9 @@ int main(int argc, char** argv) {
   // Collect the list of open files.
   OpenFilesList open_files;
   populate_open_files_list(target, &open_files);
+
+  std::string process_name = get_process_name(main_tid);
+  threads.emplace(main_tid, get_thread_name(main_tid));
 
   // Drop our capabilities now that we've attached to the threads we care about.
   drop_capabilities();
@@ -384,10 +360,10 @@ int main(int argc, char** argv) {
 
   std::string amfd_data;
   if (backtrace) {
-    dump_backtrace(output_fd.get(), backtrace_map.get(), target, main_tid, attached_siblings, 0);
+    dump_backtrace(output_fd.get(), backtrace_map.get(), target, main_tid, process_name, threads, 0);
   } else {
     engrave_tombstone(output_fd.get(), backtrace_map.get(), &open_files, target, main_tid,
-                      &attached_siblings, abort_address, fatal_signal ? &amfd_data : nullptr);
+                      process_name, threads, abort_address, fatal_signal ? &amfd_data : nullptr);
   }
 
   // We don't actually need to PTRACE_DETACH, as long as our tracees aren't in
