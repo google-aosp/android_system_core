@@ -1,13 +1,11 @@
-#pragma once
-
 /*
- * Copyright 2017, The Android Open Source Project
+ * Copyright (C) 2017 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *      http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,11 +14,21 @@
  * limitations under the License.
  */
 
-#include <sys/types.h>
+#ifndef _INIT_UEVENT_H
+#define _INIT_UEVENT_H
 
-#include <android-base/unique_fd.h>
+#include <string>
 
-bool tombstoned_connect(pid_t pid, android::base::unique_fd* tombstoned_socket,
-                        android::base::unique_fd* output_fd);
+struct Uevent {
+    std::string action;
+    std::string path;
+    std::string subsystem;
+    std::string firmware;
+    std::string partition_name;
+    std::string device_name;
+    int partition_num;
+    int major;
+    int minor;
+};
 
-bool tombstoned_notify_completion(int tombstoned_socket);
+#endif

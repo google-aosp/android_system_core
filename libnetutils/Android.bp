@@ -1,5 +1,6 @@
 cc_library_shared {
     name: "libnetutils",
+    vendor_available: true,
 
     srcs: [
         "dhcpclient.c",
@@ -16,4 +17,18 @@ cc_library_shared {
     cflags: ["-Werror"],
 
     export_include_dirs: ["include"],
+}
+
+cc_binary {
+    name: "dhcpdbg",
+
+    srcs: [
+        "dhcptool.c",
+    ],
+
+    shared_libs: [
+        "libnetutils",
+    ],
+
+    cflags: ["-Werror"],
 }

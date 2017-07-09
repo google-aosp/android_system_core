@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "debuggerd/tombstoned.h"
+#include "tombstoned/tombstoned.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -25,14 +25,17 @@
 #include <async_safe/log.h>
 #include <cutils/sockets.h>
 
-#include "debuggerd/protocol.h"
-#include "debuggerd/util.h"
+#include "protocol.h"
+#include "util.h"
 
 using android::base::unique_fd;
 
-bool tombstoned_connect(pid_t pid, unique_fd* tombstoned_socket, unique_fd* output_fd) {
-  unique_fd sockfd(socket_local_client(kTombstonedCrashSocketName,
-                                       ANDROID_SOCKET_NAMESPACE_RESERVED, SOCK_SEQPACKET));
+bool tombstoned_connect(pid_t pid, unique_fd* tombstoned_socket, unique_fd* output_fd,
+                        DebuggerdDumpType dump_type) {
+  unique_fd sockfd(
+      socket_local_client((dump_type != kDebuggerdJavaBacktrace ? kTombstonedCrashSocketName
+                                                                : kTombstonedJavaTraceSocketName),
+                          ANDROID_SOCKET_NAMESPACE_RESERVED, SOCK_SEQPACKET));
   if (sockfd == -1) {
     async_safe_format_log(ANDROID_LOG_ERROR, "libc", "failed to connect to tombstoned: %s",
                           strerror(errno));
@@ -42,6 +45,7 @@ bool tombstoned_connect(pid_t pid, unique_fd* tombstoned_socket, unique_fd* outp
   TombstonedCrashPacket packet = {};
   packet.packet_type = CrashPacketType::kDumpRequest;
   packet.packet.dump_request.pid = pid;
+  packet.packet.dump_request.dump_type = dump_type;
   if (TEMP_FAILURE_RETRY(write(sockfd, &packet, sizeof(packet))) != sizeof(packet)) {
     async_safe_format_log(ANDROID_LOG_ERROR, "libc", "failed to write DumpRequest packet: %s",
                           strerror(errno));

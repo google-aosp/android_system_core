@@ -5,21 +5,21 @@
 
 LOCAL_PATH:= $(call my-dir)
 
+include $(LOCAL_PATH)/../platform_tools_tool_version.mk
+
 adb_host_sanitize :=
 adb_target_sanitize :=
-
-adb_version := $(shell git -C $(LOCAL_PATH) rev-parse --short=12 HEAD 2>/dev/null)-android
 
 ADB_COMMON_CFLAGS := \
     -Wall -Wextra -Werror \
     -Wno-unused-parameter \
     -Wno-missing-field-initializers \
     -Wvla \
-    -DADB_REVISION='"$(adb_version)"' \
+    -DADB_VERSION="\"$(tool_version)\"" \
 
 ADB_COMMON_posix_CFLAGS := \
     -Wexit-time-destructors \
-    -Wthread-safety
+    -Wthread-safety \
 
 ADB_COMMON_linux_CFLAGS := \
     $(ADB_COMMON_posix_CFLAGS) \
@@ -232,7 +232,7 @@ LOCAL_STATIC_LIBRARIES := \
     libcutils \
     libdiagnose_usb \
     libmdnssd \
-    libgmock_host
+    libgmock_host \
 
 LOCAL_STATIC_LIBRARIES_linux := libusb
 LOCAL_STATIC_LIBRARIES_darwin := libusb
@@ -300,7 +300,7 @@ LOCAL_STATIC_LIBRARIES := \
     libcrypto \
     libdiagnose_usb \
     liblog \
-    libmdnssd
+    libmdnssd \
 
 # Don't use libcutils on Windows.
 LOCAL_STATIC_LIBRARIES_darwin := libcutils
@@ -386,5 +386,10 @@ LOCAL_STATIC_LIBRARIES := \
     libdebuggerd_handler \
 
 include $(BUILD_EXECUTABLE)
+
+# adb integration test
+# =========================================================
+$(call dist-for-goals,sdk,$(ALL_MODULES.adb_integration_test_adb.BUILT))
+$(call dist-for-goals,sdk,$(ALL_MODULES.adb_integration_test_device.BUILT))
 
 include $(call first-makefiles-under,$(LOCAL_PATH))

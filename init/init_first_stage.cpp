@@ -31,6 +31,8 @@
 #include "devices.h"
 #include "fs_mgr.h"
 #include "fs_mgr_avb.h"
+#include "uevent.h"
+#include "uevent_listener.h"
 #include "util.h"
 
 // Class Declarations
@@ -47,18 +49,24 @@ class FirstStageMount {
     bool InitDevices();
 
   protected:
-    void InitRequiredDevices(std::set<std::string>* devices_partition_names);
+    void InitRequiredDevices();
     void InitVerityDevice(const std::string& verity_device);
     bool MountPartitions();
 
-    virtual bool GetRequiredDevices(std::set<std::string>* out_devices_partition_names,
-                                    bool* out_need_dm_verity) = 0;
+    virtual RegenerationAction UeventCallback(const Uevent& uevent);
+
+    // Pure virtual functions.
+    virtual bool GetRequiredDevices() = 0;
     virtual bool SetUpDmVerity(fstab_rec* fstab_rec) = 0;
 
+    bool need_dm_verity_;
     // Device tree fstab entries.
     std::unique_ptr<fstab, decltype(&fs_mgr_free_fstab)> device_tree_fstab_;
     // Eligible first stage mount candidates, only allow /system, /vendor and/or /odm.
     std::vector<fstab_rec*> mount_fstab_recs_;
+    std::set<std::string> required_devices_partition_names_;
+    DeviceHandler device_handler_;
+    UeventListener uevent_listener_;
 };
 
 class FirstStageMountVBootV1 : public FirstStageMount {
@@ -67,27 +75,26 @@ class FirstStageMountVBootV1 : public FirstStageMount {
     ~FirstStageMountVBootV1() override = default;
 
   protected:
-    bool GetRequiredDevices(std::set<std::string>* out_devices_partition_names,
-                            bool* out_need_dm_verity) override;
+    bool GetRequiredDevices() override;
     bool SetUpDmVerity(fstab_rec* fstab_rec) override;
 };
 
 class FirstStageMountVBootV2 : public FirstStageMount {
   public:
+    friend void SetInitAvbVersionInRecovery();
+
     FirstStageMountVBootV2();
     ~FirstStageMountVBootV2() override = default;
 
-    const std::string& by_name_prefix() const { return device_tree_by_name_prefix_; }
-
   protected:
-    bool GetRequiredDevices(std::set<std::string>* out_devices_partition_names,
-                            bool* out_need_dm_verity) override;
+    RegenerationAction UeventCallback(const Uevent& uevent) override;
+    bool GetRequiredDevices() override;
     bool SetUpDmVerity(fstab_rec* fstab_rec) override;
     bool InitAvbHandle();
 
     std::string device_tree_vbmeta_parts_;
-    std::string device_tree_by_name_prefix_;
     FsManagerAvbUniquePtr avb_handle_;
+    ByNameSymlinkMap by_name_symlink_map_;
 };
 
 // Static Functions
@@ -102,7 +109,8 @@ static bool inline IsRecoveryMode() {
 
 // Class Definitions
 // -----------------
-FirstStageMount::FirstStageMount() : device_tree_fstab_(fs_mgr_read_fstab_dt(), fs_mgr_free_fstab) {
+FirstStageMount::FirstStageMount()
+    : need_dm_verity_(false), device_tree_fstab_(fs_mgr_read_fstab_dt(), fs_mgr_free_fstab) {
     if (!device_tree_fstab_) {
         LOG(ERROR) << "Failed to read fstab from device tree";
         return;
@@ -136,72 +144,75 @@ bool FirstStageMount::DoFirstStageMount() {
 }
 
 bool FirstStageMount::InitDevices() {
-    bool need_dm_verity;
-    std::set<std::string> devices_partition_names;
+    if (!GetRequiredDevices()) return false;
 
-    // The partition name in devices_partition_names MUST have A/B suffix when A/B is used.
-    if (!GetRequiredDevices(&devices_partition_names, &need_dm_verity)) return false;
+    InitRequiredDevices();
 
-    if (need_dm_verity) {
-        const std::string dm_path = "/devices/virtual/misc/device-mapper";
-        device_init(("/sys" + dm_path).c_str(), [&dm_path](uevent* uevent) -> coldboot_action_t {
-            if (uevent->path == dm_path) return COLDBOOT_STOP;
-            return COLDBOOT_CONTINUE;  // dm_path not found, continue to find it.
-        });
-    }
-
-    bool success = false;
-    InitRequiredDevices(&devices_partition_names);
-
-    // InitRequiredDevices() will remove found partitions from devices_partition_names.
+    // InitRequiredDevices() will remove found partitions from required_devices_partition_names_.
     // So if it isn't empty here, it means some partitions are not found.
-    if (!devices_partition_names.empty()) {
+    if (!required_devices_partition_names_.empty()) {
         LOG(ERROR) << __FUNCTION__ << "(): partition(s) not found: "
-                   << android::base::Join(devices_partition_names, ", ");
+                   << android::base::Join(required_devices_partition_names_, ", ");
+        return false;
     } else {
-        success = true;
+        return true;
     }
-
-    device_close();
-    return success;
 }
 
-// Creates devices with uevent->partition_name matching one in the in/out
-// devices_partition_names. Found partitions will then be removed from the
-// devices_partition_names for the caller to check which devices are NOT created.
-void FirstStageMount::InitRequiredDevices(std::set<std::string>* devices_partition_names) {
-    if (devices_partition_names->empty()) {
+// Creates devices with uevent->partition_name matching one in the member variable
+// required_devices_partition_names_. Found partitions will then be removed from it
+// for the subsequent member function to check which devices are NOT created.
+void FirstStageMount::InitRequiredDevices() {
+    if (required_devices_partition_names_.empty()) {
         return;
     }
-    device_init(nullptr, [=](uevent* uevent) -> coldboot_action_t {
-        // We need platform devices to create symlinks.
-        if (uevent->subsystem == "platform") {
-            return COLDBOOT_CREATE;
-        }
 
-        // Ignores everything that is not a block device.
-        if (uevent->subsystem != "block") {
-            return COLDBOOT_CONTINUE;
-        }
+    if (need_dm_verity_) {
+        const std::string dm_path = "/devices/virtual/misc/device-mapper";
+        uevent_listener_.RegenerateUeventsForPath("/sys" + dm_path,
+                                                  [this, &dm_path](const Uevent& uevent) {
+                                                      if (uevent.path == dm_path) {
+                                                          device_handler_.HandleDeviceEvent(uevent);
+                                                          return RegenerationAction::kStop;
+                                                      }
+                                                      return RegenerationAction::kContinue;
+                                                  });
+    }
 
-        if (!uevent->partition_name.empty()) {
-            // Matches partition name to create device nodes.
-            // Both devices_partition_names and uevent->partition_name have A/B
-            // suffix when A/B is used.
-            auto iter = devices_partition_names->find(uevent->partition_name);
-            if (iter != devices_partition_names->end()) {
-                LOG(VERBOSE) << __FUNCTION__ << "(): found partition: " << *iter;
-                devices_partition_names->erase(iter);
-                if (devices_partition_names->empty()) {
-                    return COLDBOOT_STOP;  // Found all partitions, stop coldboot.
-                } else {
-                    return COLDBOOT_CREATE;  // Creates this device and continue to find others.
-                }
+    uevent_listener_.RegenerateUevents(
+        [this](const Uevent& uevent) { return UeventCallback(uevent); });
+}
+
+RegenerationAction FirstStageMount::UeventCallback(const Uevent& uevent) {
+    // We need platform devices to create symlinks.
+    if (uevent.subsystem == "platform") {
+        device_handler_.HandleDeviceEvent(uevent);
+        return RegenerationAction::kContinue;
+    }
+
+    // Ignores everything that is not a block device.
+    if (uevent.subsystem != "block") {
+        return RegenerationAction::kContinue;
+    }
+
+    if (!uevent.partition_name.empty()) {
+        // Matches partition name to create device nodes.
+        // Both required_devices_partition_names_ and uevent->partition_name have A/B
+        // suffix when A/B is used.
+        auto iter = required_devices_partition_names_.find(uevent.partition_name);
+        if (iter != required_devices_partition_names_.end()) {
+            LOG(VERBOSE) << __FUNCTION__ << "(): found partition: " << *iter;
+            required_devices_partition_names_.erase(iter);
+            device_handler_.HandleDeviceEvent(uevent);
+            if (required_devices_partition_names_.empty()) {
+                return RegenerationAction::kStop;
+            } else {
+                return RegenerationAction::kContinue;
             }
         }
-        // Not found a partition or find an unneeded partition, continue to find others.
-        return COLDBOOT_CONTINUE;
-    });
+    }
+    // Not found a partition or find an unneeded partition, continue to find others.
+    return RegenerationAction::kContinue;
 }
 
 // Creates "/dev/block/dm-XX" for dm-verity by running coldboot on /sys/block/dm-XX.
@@ -209,14 +220,15 @@ void FirstStageMount::InitVerityDevice(const std::string& verity_device) {
     const std::string device_name(basename(verity_device.c_str()));
     const std::string syspath = "/sys/block/" + device_name;
 
-    device_init(syspath.c_str(), [&](uevent* uevent) -> coldboot_action_t {
-        if (uevent->device_name == device_name) {
-            LOG(VERBOSE) << "Creating dm-verity device : " << verity_device;
-            return COLDBOOT_STOP;
-        }
-        return COLDBOOT_CONTINUE;
-    });
-    device_close();
+    uevent_listener_.RegenerateUeventsForPath(
+        syspath, [&device_name, &verity_device, this](const Uevent& uevent) {
+            if (uevent.device_name == device_name) {
+                LOG(VERBOSE) << "Creating dm-verity device : " << verity_device;
+                device_handler_.HandleDeviceEvent(uevent);
+                return RegenerationAction::kStop;
+            }
+            return RegenerationAction::kContinue;
+        });
 }
 
 bool FirstStageMount::MountPartitions() {
@@ -233,10 +245,9 @@ bool FirstStageMount::MountPartitions() {
     return true;
 }
 
-bool FirstStageMountVBootV1::GetRequiredDevices(std::set<std::string>* out_devices_partition_names,
-                                                bool* out_need_dm_verity) {
+bool FirstStageMountVBootV1::GetRequiredDevices() {
     std::string verity_loc_device;
-    *out_need_dm_verity = false;
+    need_dm_verity_ = false;
 
     for (auto fstab_rec : mount_fstab_recs_) {
         // Don't allow verifyatboot in the first stage.
@@ -246,7 +257,7 @@ bool FirstStageMountVBootV1::GetRequiredDevices(std::set<std::string>* out_devic
         }
         // Checks for verified partitions.
         if (fs_mgr_is_verified(fstab_rec)) {
-            *out_need_dm_verity = true;
+            need_dm_verity_ = true;
         }
         // Checks if verity metadata is on a separate partition. Note that it is
         // not partition specific, so there must be only one additional partition
@@ -265,11 +276,11 @@ bool FirstStageMountVBootV1::GetRequiredDevices(std::set<std::string>* out_devic
     // Includes the partition names of fstab records and verity_loc_device (if any).
     // Notes that fstab_rec->blk_device has A/B suffix updated by fs_mgr when A/B is used.
     for (auto fstab_rec : mount_fstab_recs_) {
-        out_devices_partition_names->emplace(basename(fstab_rec->blk_device));
+        required_devices_partition_names_.emplace(basename(fstab_rec->blk_device));
     }
 
     if (!verity_loc_device.empty()) {
-        out_devices_partition_names->emplace(basename(verity_loc_device.c_str()));
+        required_devices_partition_names_.emplace(basename(verity_loc_device.c_str()));
     }
 
     return true;
@@ -292,15 +303,13 @@ bool FirstStageMountVBootV1::SetUpDmVerity(fstab_rec* fstab_rec) {
 }
 
 // FirstStageMountVBootV2 constructor.
-// Gets the vbmeta configurations from device tree.
-// Specifically, the 'parts' and 'by_name_prefix' below.
+// Gets the vbmeta partitions from device tree.
 // /{
 //     firmware {
 //         android {
 //             vbmeta {
 //                 compatible = "android,vbmeta";
 //                 parts = "vbmeta,boot,system,vendor"
-//                 by_name_prefix = "/dev/block/platform/soc.0/f9824900.sdhci/by-name/"
 //             };
 //         };
 //     };
@@ -310,31 +319,24 @@ FirstStageMountVBootV2::FirstStageMountVBootV2() : avb_handle_(nullptr) {
         PLOG(ERROR) << "Failed to read vbmeta/parts from device tree";
         return;
     }
-
-    // TODO: removes by_name_prefix to allow partitions on different block devices.
-    if (!read_android_dt_file("vbmeta/by_name_prefix", &device_tree_by_name_prefix_)) {
-        PLOG(ERROR) << "Failed to read vbmeta/by_name_prefix from dt";
-        return;
-    }
 }
 
-bool FirstStageMountVBootV2::GetRequiredDevices(std::set<std::string>* out_devices_partition_names,
-                                                bool* out_need_dm_verity) {
-    *out_need_dm_verity = false;
+bool FirstStageMountVBootV2::GetRequiredDevices() {
+    need_dm_verity_ = false;
 
     // fstab_rec->blk_device has A/B suffix.
     for (auto fstab_rec : mount_fstab_recs_) {
         if (fs_mgr_is_avb(fstab_rec)) {
-            *out_need_dm_verity = true;
+            need_dm_verity_ = true;
         }
-        out_devices_partition_names->emplace(basename(fstab_rec->blk_device));
+        required_devices_partition_names_.emplace(basename(fstab_rec->blk_device));
     }
 
     // libavb verifies AVB metadata on all verified partitions at once.
     // e.g., The device_tree_vbmeta_parts_ will be "vbmeta,boot,system,vendor"
     // for libavb to verify metadata, even if there is only /vendor in the
     // above mount_fstab_recs_.
-    if (*out_need_dm_verity) {
+    if (need_dm_verity_) {
         if (device_tree_vbmeta_parts_.empty()) {
             LOG(ERROR) << "Missing vbmeta parts in device tree";
             return false;
@@ -342,14 +344,42 @@ bool FirstStageMountVBootV2::GetRequiredDevices(std::set<std::string>* out_devic
         std::vector<std::string> partitions = android::base::Split(device_tree_vbmeta_parts_, ",");
         std::string ab_suffix = fs_mgr_get_slot_suffix();
         for (const auto& partition : partitions) {
-            // out_devices_partition_names is of type std::set so it's not an issue to emplace
-            // a partition twice. e.g., /vendor might be in both places:
+            // required_devices_partition_names_ is of type std::set so it's not an issue
+            // to emplace a partition twice. e.g., /vendor might be in both places:
             //   - device_tree_vbmeta_parts_ = "vbmeta,boot,system,vendor"
             //   - mount_fstab_recs_: /vendor_a
-            out_devices_partition_names->emplace(partition + ab_suffix);
+            required_devices_partition_names_.emplace(partition + ab_suffix);
         }
     }
     return true;
+}
+
+RegenerationAction FirstStageMountVBootV2::UeventCallback(const Uevent& uevent) {
+    // Check if this uevent corresponds to one of the required partitions and store its symlinks if
+    // so, in order to create FsManagerAvbHandle later.
+    // Note that the parent callback removes partitions from the list of required partitions
+    // as it finds them, so this must happen first.
+    if (!uevent.partition_name.empty() &&
+        required_devices_partition_names_.find(uevent.partition_name) !=
+            required_devices_partition_names_.end()) {
+        // GetBlockDeviceSymlinks() will return three symlinks at most, depending on
+        // the content of uevent. by-name symlink will be at [0] if uevent->partition_name
+        // is not empty. e.g.,
+        //   - /dev/block/platform/soc.0/f9824900.sdhci/by-name/modem
+        //   - /dev/block/platform/soc.0/f9824900.sdhci/by-num/p1
+        //   - /dev/block/platform/soc.0/f9824900.sdhci/mmcblk0p1
+        std::vector<std::string> links = device_handler_.GetBlockDeviceSymlinks(uevent);
+        if (!links.empty()) {
+            auto[it, inserted] = by_name_symlink_map_.emplace(uevent.partition_name, links[0]);
+            if (!inserted) {
+                LOG(ERROR) << "Partition '" << uevent.partition_name
+                           << "' already existed in the by-name symlink map with a value of '"
+                           << it->second << "', new value '" << links[0] << "' will be ignored.";
+            }
+        }
+    }
+
+    return FirstStageMount::UeventCallback(uevent);
 }
 
 bool FirstStageMountVBootV2::SetUpDmVerity(fstab_rec* fstab_rec) {
@@ -371,7 +401,14 @@ bool FirstStageMountVBootV2::SetUpDmVerity(fstab_rec* fstab_rec) {
 bool FirstStageMountVBootV2::InitAvbHandle() {
     if (avb_handle_) return true;  // Returns true if the handle is already initialized.
 
-    avb_handle_ = FsManagerAvbHandle::Open(device_tree_by_name_prefix_);
+    if (by_name_symlink_map_.empty()) {
+        LOG(ERROR) << "by_name_symlink_map_ is empty";
+        return false;
+    }
+
+    avb_handle_ = FsManagerAvbHandle::Open(std::move(by_name_symlink_map_));
+    by_name_symlink_map_.clear();  // Removes all elements after the above std::move().
+
     if (!avb_handle_) {
         PLOG(ERROR) << "Failed to open FsManagerAvbHandle";
         return false;
@@ -427,7 +464,8 @@ void SetInitAvbVersionInRecovery() {
         return;
     }
 
-    FsManagerAvbUniquePtr avb_handle = FsManagerAvbHandle::Open(avb_first_mount.by_name_prefix());
+    FsManagerAvbUniquePtr avb_handle =
+        FsManagerAvbHandle::Open(std::move(avb_first_mount.by_name_symlink_map_));
     if (!avb_handle) {
         PLOG(ERROR) << "Failed to open FsManagerAvbHandle for INIT_AVB_VERSION";
         return;

@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2015 The Android Open-Source Project
+# Copyright (C) 2017 The Android Open Source Project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,12 +14,19 @@
 # limitations under the License.
 #
 
-LOCAL_PATH:= $(call my-dir)
+LOCAL_PATH := $(call my-dir)
 
 include $(CLEAR_VARS)
 
-LOCAL_MODULE := libtrustystorageinterface
+LOCAL_MODULE := demangle_fuzzer
+LOCAL_MODULE_TAGS := optional
+LOCAL_SRC_FILES := \
+    Demangler.cpp \
+    demangle_fuzzer.cpp \
 
-LOCAL_EXPORT_C_INCLUDE_DIRS := $(LOCAL_PATH)/include
+LOCAL_CFLAGS := \
+    -Wall \
+    -Werror \
+    -Wextra \
 
-include $(BUILD_STATIC_LIBRARY)
+include $(BUILD_FUZZ_TEST)

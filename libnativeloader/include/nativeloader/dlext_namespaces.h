@@ -55,6 +55,12 @@ enum {
    * permitted_path from the caller's namespace.
    */
   ANDROID_NAMESPACE_TYPE_SHARED = 2,
+
+  /* This flag instructs linker to enable grey-list workaround for the namespace.
+   * See http://b/26394120 for details.
+   */
+  ANDROID_NAMESPACE_TYPE_GREYLIST_ENABLED = 0x08000000,
+
   ANDROID_NAMESPACE_TYPE_SHARED_ISOLATED = ANDROID_NAMESPACE_TYPE_SHARED |
                                            ANDROID_NAMESPACE_TYPE_ISOLATED,
 };
@@ -117,6 +123,8 @@ extern bool android_link_namespaces(android_namespace_t* from,
  * is sufficient and used by all callers of this function.
  */
 extern void android_get_LD_LIBRARY_PATH(char* buffer, size_t buffer_size);
+
+extern android_namespace_t* android_get_exported_namespace(const char* name);
 
 __END_DECLS
 

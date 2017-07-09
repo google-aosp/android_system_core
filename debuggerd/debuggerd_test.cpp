@@ -29,16 +29,18 @@
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/macros.h>
 #include <android-base/parseint.h>
 #include <android-base/properties.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 #include <cutils/sockets.h>
-#include <debuggerd/handler.h>
-#include <debuggerd/protocol.h>
-#include <debuggerd/tombstoned.h>
-#include <debuggerd/util.h>
 #include <gtest/gtest.h>
+
+#include "debuggerd/handler.h"
+#include "protocol.h"
+#include "tombstoned/tombstoned.h"
+#include "util.h"
 
 using namespace std::chrono_literals;
 using android::base::unique_fd;
@@ -86,14 +88,15 @@ constexpr char kWaitForGdbKey[] = "debug.debuggerd.wait_for_gdb";
     }                                                                                       \
   } while (0)
 
-static void tombstoned_intercept(pid_t target_pid, unique_fd* intercept_fd, unique_fd* output_fd) {
+static void tombstoned_intercept(pid_t target_pid, unique_fd* intercept_fd, unique_fd* output_fd,
+                                 DebuggerdDumpType intercept_type) {
   intercept_fd->reset(socket_local_client(kTombstonedInterceptSocketName,
                                           ANDROID_SOCKET_NAMESPACE_RESERVED, SOCK_SEQPACKET));
   if (intercept_fd->get() == -1) {
     FAIL() << "failed to contact tombstoned: " << strerror(errno);
   }
 
-  InterceptRequest req = {.pid = target_pid};
+  InterceptRequest req = {.pid = target_pid, .dump_type = intercept_type};
 
   unique_fd output_pipe_write;
   if (!Pipe(output_fd, &output_pipe_write)) {
@@ -144,12 +147,12 @@ class CrasherTest : public ::testing::Test {
   CrasherTest();
   ~CrasherTest();
 
-  void StartIntercept(unique_fd* output_fd);
+  void StartIntercept(unique_fd* output_fd, DebuggerdDumpType intercept_type = kDebuggerdTombstone);
 
   // Returns -1 if we fail to read a response from tombstoned, otherwise the received return code.
   void FinishIntercept(int* result);
 
-  void StartProcess(std::function<void()> function);
+  void StartProcess(std::function<void()> function, std::function<pid_t()> forker = fork);
   void StartCrasher(const std::string& crash_type);
   void FinishCrasher();
   void AssertDeath(int signo);
@@ -170,12 +173,12 @@ CrasherTest::~CrasherTest() {
   android::base::SetProperty(kWaitForGdbKey, previous_wait_for_gdb ? "1" : "0");
 }
 
-void CrasherTest::StartIntercept(unique_fd* output_fd) {
+void CrasherTest::StartIntercept(unique_fd* output_fd, DebuggerdDumpType intercept_type) {
   if (crasher_pid == -1) {
     FAIL() << "crasher hasn't been started";
   }
 
-  tombstoned_intercept(crasher_pid, &this->intercept_fd, output_fd);
+  tombstoned_intercept(crasher_pid, &this->intercept_fd, output_fd, intercept_type);
 }
 
 void CrasherTest::FinishIntercept(int* result) {
@@ -195,14 +198,14 @@ void CrasherTest::FinishIntercept(int* result) {
   }
 }
 
-void CrasherTest::StartProcess(std::function<void()> function) {
+void CrasherTest::StartProcess(std::function<void()> function, std::function<pid_t()> forker) {
   unique_fd read_pipe;
   unique_fd crasher_read_pipe;
   if (!Pipe(&crasher_read_pipe, &crasher_pipe)) {
     FAIL() << "failed to create pipe: " << strerror(errno);
   }
 
-  crasher_pid = fork();
+  crasher_pid = forker();
   if (crasher_pid == -1) {
     FAIL() << "fork failed: " << strerror(errno);
   } else if (crasher_pid == 0) {
@@ -426,7 +429,7 @@ TEST_F(CrasherTest, backtrace) {
   StartProcess([]() {
     abort();
   });
-  StartIntercept(&output_fd);
+  StartIntercept(&output_fd, kDebuggerdNativeBacktrace);
 
   std::this_thread::sleep_for(500ms);
 
@@ -527,6 +530,37 @@ TEST_F(CrasherTest, capabilities) {
   ASSERT_MATCH(result, R"(#00 pc [0-9a-f]+\s+ /system/lib)" ARCH_SUFFIX R"(/libc.so \(tgkill)");
 }
 
+TEST_F(CrasherTest, fake_pid) {
+  int intercept_result;
+  unique_fd output_fd;
+
+  // Prime the getpid/gettid caches.
+  UNUSED(getpid());
+  UNUSED(gettid());
+
+  std::function<pid_t()> clone_fn = []() {
+    return syscall(__NR_clone, SIGCHLD, nullptr, nullptr, nullptr, nullptr);
+  };
+  StartProcess(
+      []() {
+        ASSERT_NE(getpid(), syscall(__NR_getpid));
+        ASSERT_NE(gettid(), syscall(__NR_gettid));
+        raise(SIGSEGV);
+      },
+      clone_fn);
+
+  StartIntercept(&output_fd);
+  FinishCrasher();
+  AssertDeath(SIGSEGV);
+  FinishIntercept(&intercept_result);
+
+  ASSERT_EQ(1, intercept_result) << "tombstoned reported failure";
+
+  std::string result;
+  ConsumeFd(std::move(output_fd), &result);
+  ASSERT_MATCH(result, R"(#00 pc [0-9a-f]+\s+ /system/lib)" ARCH_SUFFIX R"(/libc.so \(tgkill)");
+}
+
 TEST(crash_dump, zombie) {
   pid_t forkpid = fork();
 
@@ -562,11 +596,11 @@ TEST(tombstoned, no_notify) {
     pid_t pid = 123'456'789 + i;
 
     unique_fd intercept_fd, output_fd;
-    tombstoned_intercept(pid, &intercept_fd, &output_fd);
+    tombstoned_intercept(pid, &intercept_fd, &output_fd, kDebuggerdTombstone);
 
     {
       unique_fd tombstoned_socket, input_fd;
-      ASSERT_TRUE(tombstoned_connect(pid, &tombstoned_socket, &input_fd));
+      ASSERT_TRUE(tombstoned_connect(pid, &tombstoned_socket, &input_fd, kDebuggerdTombstone));
       ASSERT_TRUE(android::base::WriteFully(input_fd.get(), &pid, sizeof(pid)));
     }
 
@@ -594,7 +628,7 @@ TEST(tombstoned, stress) {
       pid_t pid = pid_base + dump;
 
       unique_fd intercept_fd, output_fd;
-      tombstoned_intercept(pid, &intercept_fd, &output_fd);
+      tombstoned_intercept(pid, &intercept_fd, &output_fd, kDebuggerdTombstone);
 
       // Pretend to crash, and then immediately close the socket.
       unique_fd sockfd(socket_local_client(kTombstonedCrashSocketName,
@@ -625,11 +659,11 @@ TEST(tombstoned, stress) {
       pid_t pid = pid_base + dump;
 
       unique_fd intercept_fd, output_fd;
-      tombstoned_intercept(pid, &intercept_fd, &output_fd);
+      tombstoned_intercept(pid, &intercept_fd, &output_fd, kDebuggerdTombstone);
 
       {
         unique_fd tombstoned_socket, input_fd;
-        ASSERT_TRUE(tombstoned_connect(pid, &tombstoned_socket, &input_fd));
+        ASSERT_TRUE(tombstoned_connect(pid, &tombstoned_socket, &input_fd, kDebuggerdTombstone));
         ASSERT_TRUE(android::base::WriteFully(input_fd.get(), &pid, sizeof(pid)));
         tombstoned_notify_completion(tombstoned_socket.get());
       }

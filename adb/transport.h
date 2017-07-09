@@ -51,6 +51,8 @@ extern const char* const kFeatureCmd;
 extern const char* const kFeatureStat2;
 // The server is running with libusb enabled.
 extern const char* const kFeatureLibusb;
+// The server supports `push --sync`.
+extern const char* const kFeaturePushSync;
 
 class atransport {
 public:
@@ -198,11 +200,16 @@ atransport* acquire_one_transport(TransportType type, const char* serial, bool* 
 void kick_transport(atransport* t);
 void update_transports(void);
 
+// Iterates across all of the current and pending transports.
+// Stops iteration and returns false if fn returns false, otherwise returns true.
+bool iterate_transports(std::function<bool(const atransport*)> fn);
+
 void init_transport_registration(void);
 void init_mdns_transport_discovery(void);
 std::string list_transports(bool long_listing);
 atransport* find_transport(const char* serial);
 void kick_all_tcp_devices();
+void kick_all_transports();
 
 void register_usb_transport(usb_handle* h, const char* serial,
                             const char* devpath, unsigned writeable);
@@ -216,8 +223,8 @@ int register_socket_transport(int s, const char* serial, int port, int local);
 // This should only be used for transports with connection_state == kCsNoPerm.
 void unregister_usb_transport(usb_handle* usb);
 
-int check_header(apacket* p, atransport* t);
-int check_data(apacket* p);
+bool check_header(apacket* p, atransport* t);
+bool check_data(apacket* p);
 
 void close_usb_devices();
 void close_usb_devices(std::function<bool(const atransport*)> predicate);

@@ -22,7 +22,8 @@ cc_defaults {
 
         // 524291 corresponds to sysui_histogram, from
         // frameworks/base/core/java/com/android/internal/logging/EventLogTags.logtags
-        "-DHISTOGRAM_LOG_TAG=524291",
+        "-DHISTOGRAM_LOG_TAG=524292",
+        "-DCOUNT_LOG_TAG=524290",
     ],
 }
 
@@ -30,6 +31,7 @@ cc_defaults {
 // -----------------------------------------------------------------------------
 cc_library_shared {
     name: "libmetricslogger",
+    vendor_available: true,
     srcs: metricslogger_lib_src_files,
     defaults: ["metricslogger_defaults"],
 }
